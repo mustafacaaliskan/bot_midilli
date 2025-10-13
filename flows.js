@@ -83,7 +83,7 @@ async function sendViaSMTP(mailOptions) {
 // Minimal Resend HTTPS client (no extra deps)
 async function sendViaResend({ from, to, subject, text, attachments }) {
   const apiKeyRaw = process.env.RESEND_API_KEY;
-  const apiKey = apiKeyRaw && String(apiKeyRaw).trim();
+  const apiKey = apiKeyRaw && String(apiKeyRaw).replace(/\s+/g, '').trim();
   const senderRaw = process.env.RESEND_FROM || from;
   const sender = senderRaw && String(senderRaw).trim();
   if (!apiKey) throw new Error('RESEND_API_KEY missing');
@@ -123,7 +123,7 @@ async function sendViaResend({ from, to, subject, text, attachments }) {
 // Minimal SendGrid HTTPS client (no extra deps)
 async function sendViaSendGrid({ from, to, subject, text, attachments }) {
   const apiKeyRaw = process.env.SENDGRID_API_KEY;
-  const apiKey = apiKeyRaw && String(apiKeyRaw).trim();
+  const apiKey = apiKeyRaw && String(apiKeyRaw).replace(/\s+/g, '').trim();
   const senderRaw = process.env.SENDGRID_FROM || from;
   const sender = senderRaw && String(senderRaw).trim();
   if (!apiKey) throw new Error('SENDGRID_API_KEY missing');
@@ -169,7 +169,7 @@ async function sendViaSendGrid({ from, to, subject, text, attachments }) {
 // Brevo (Sendinblue) HTTPS client
 async function sendViaBrevo({ from, to, subject, text, attachments }) {
   const apiKeyRaw = process.env.BREVO_API_KEY;
-  const apiKey = apiKeyRaw && String(apiKeyRaw).trim();
+  const apiKey = apiKeyRaw && String(apiKeyRaw).replace(/\s+/g, '').trim();
   const senderRaw = process.env.BREVO_FROM || from;
   const sender = senderRaw && String(senderRaw).trim();
   if (!apiKey) throw new Error('BREVO_API_KEY missing');
@@ -201,6 +201,10 @@ async function sendViaBrevo({ from, to, subject, text, attachments }) {
     const textBody = await res.text().catch(() => '');
     // Add a helpful hint for common 401 issues
     const hint = res.status === 401 ? ' Hint: Check BREVO_API_KEY value, environment variable name, and project access. Ensure the key is not empty and has SMTP permissions.' : '';
+    // Masked diagnostics: key length and suffix help verify what runtime sees
+    const keyLen = apiKey ? apiKey.length : 0;
+    const maskedSuffix = apiKey && keyLen >= 6 ? apiKey.slice(-6) : '';
+    console.error('Brevo auth diagnostics:', { keyLen, maskedSuffix });
     const err = new Error(`Brevo API error: ${res.status} ${res.statusText} ${textBody}${hint}`);
     // @ts-ignore
     err.status = res.status;
