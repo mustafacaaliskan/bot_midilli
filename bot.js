@@ -1,10 +1,10 @@
+require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const XLSX = require('xlsx');
 const fs = require('fs');
 const config = require('./config');
 const ui = require('./ui');
 const flows = require('./flows');
-require('dotenv').config();
 const {
   saveUserState,
   getUserState,

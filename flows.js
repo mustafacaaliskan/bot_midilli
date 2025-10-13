@@ -12,8 +12,11 @@ function getOpenAIKey() {
   return normalized;
 }
 
-const openAIKey = getOpenAIKey();
-const openai = openAIKey ? new OpenAI({ apiKey: openAIKey }) : null;
+function getOpenAIClient() {
+  const key = getOpenAIKey();
+  if (!key) return null;
+  return new OpenAI({ apiKey: key });
+}
 
 function escapeTelegramMarkdown(input) {
   if (input == null) return '';
@@ -37,7 +40,8 @@ const transporter = nodemailer.createTransport({
 });
 
 async function createWithAI(bot, chatId, userId, callbackMessageId = null) {
-  if (!openAIKey || !openai) {
+  const openai = getOpenAIClient();
+  if (!openai) {
     const { replaceCard, updateCard } = require('./ui');
     const keyboard = { reply_markup: { inline_keyboard: [[{ text: "🏠 Ana Menü", callback_data: "main_menu" }]] } };
     const message = "Yapay zeka özelliği yapılandırılmamış. Lütfen yöneticiye bildirin.";
@@ -77,7 +81,8 @@ async function processAIContent(bot, chatId, userId, content) {
 }
 
 async function processAITone(bot, chatId, userId, tone) {
-  if (!openAIKey || !openai) {
+  const openai = getOpenAIClient();
+  if (!openai) {
     const { replaceCard } = require('./ui');
     await replaceCard(bot, chatId, userId, "Yapay zeka özelliği yapılandırılmamış.", { reply_markup: { inline_keyboard: [[{ text: "🏠 Ana Menü", callback_data: "main_menu" }]] } });
     return;
