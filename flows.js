@@ -49,7 +49,74 @@ const transporter = nodemailer.createTransport({
   port: smtpPort,
   secure: smtpSecure,
   auth: { user: smtpUser, pass: smtpPass },
+  // Add sane timeouts to avoid indefinite hangs on platforms that block SMTP
+  connectionTimeout: 10000, // 10s
+  greetingTimeout: 10000,   // 10s
+  socketTimeout: 20000,     // 20s
+  // For STARTTLS (587), require TLS to avoid downgrade
+  requireTLS: smtpPort === 587,
 });
+
+function timeoutPromise(ms) {
+  return new Promise((_, reject) => {
+    const err = new Error(`Timeout after ${ms}ms`);
+    err.code = 'ETIMEOUT';
+    setTimeout(() => reject(err), ms);
+  });
+}
+
+async function verifySMTP() {
+  try {
+    // Verify with an upper bound so we don't hang forever
+    await Promise.race([transporter.verify(), timeoutPromise(12000)]);
+    return true;
+  } catch (e) {
+    console.error('SMTP verify failed:', e && (e.code || e.name), e && e.message);
+    return false;
+  }
+}
+
+async function sendViaSMTP(mailOptions) {
+  return transporter.sendMail(mailOptions);
+}
+
+// Minimal Resend HTTPS client (no extra deps)
+async function sendViaResend({ from, to, subject, text, attachments }) {
+  const apiKey = process.env.RESEND_API_KEY;
+  const sender = process.env.RESEND_FROM || from;
+  if (!apiKey) throw new Error('RESEND_API_KEY missing');
+
+  const payload = { from: sender, to: Array.isArray(to) ? to : String(to).split(',').map(s => s.trim()).filter(Boolean), subject, text };
+
+  if (attachments && attachments.length > 0) {
+    // Resend expects base64 attachments: { filename, content } where content is base64 string
+    payload.attachments = attachments.map(a => ({
+      filename: a.filename || a.name,
+      content: Buffer.isBuffer(a.content) ? a.content.toString('base64') : Buffer.from(String(a.content)).toString('base64'),
+    }));
+  }
+
+  const body = JSON.stringify(payload);
+
+  // Using built-in fetch (Node >= 18). If not available, Railway typically has modern Node.
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body,
+  });
+  if (!res.ok) {
+    const textBody = await res.text().catch(() => '');
+    const err = new Error(`Resend API error: ${res.status} ${res.statusText} ${textBody}`);
+    // Attach for logging context
+    // @ts-ignore
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}
 
 async function createWithAI(bot, chatId, userId, callbackMessageId = null) {
   const openai = getOpenAIClient();
@@ -273,7 +340,49 @@ async function sendEmail(bot, chatId, userId) {
     if (attachments.length > 0) {
       mailOptions.attachments = attachments.map(file => ({ filename: file.name, content: file.content, contentType: file.mimeType }));
     }
-    await transporter.sendMail(mailOptions);
+
+    const forceResend = (process.env.FORCE_EMAIL_PROVIDER || '').toLowerCase() === 'resend';
+    const hasResend = Boolean(process.env.RESEND_API_KEY);
+
+    let sent = false;
+    let lastError = null;
+
+    if (!forceResend) {
+      const ok = await verifySMTP();
+      if (ok) {
+        try {
+          await sendViaSMTP(mailOptions);
+          sent = true;
+        } catch (e) {
+          lastError = e;
+          console.error('SMTP send failed:', e && (e.code || e.name), e && e.message);
+        }
+      } else {
+        lastError = new Error('SMTP verification failed');
+      }
+    }
+
+    if (!sent && hasResend) {
+      try {
+        await sendViaResend({
+          from: mailOptions.from,
+          to: mailOptions.to,
+          subject: mailOptions.subject,
+          text: mailOptions.text,
+          attachments: mailOptions.attachments,
+        });
+        sent = true;
+      } catch (e) {
+        lastError = e;
+        console.error('Resend send failed:', e && (e.code || e.name), e && e.message);
+      }
+    }
+
+    if (!sent) {
+      const hint = hasResend ? 'SMTP ve Resend başarısız.' : 'SMTP başarısız. Resend yapılandırılmadı.';
+      throw new Error(hint + (lastError ? ` Last error: ${lastError.message}` : ''));
+    }
+
     bot.editMessageText(`✅ Mail başarıyla gönderildi!\n\nAlıcılar: ${recipients.join(', ')}`, { chat_id: chatId, message_id: messageId, reply_markup: keyboard.reply_markup });
     clearUserState(userId);
     setTimeout(() => require('./ui').showMainMenu(bot, chatId, userId, messageId), 2000);
