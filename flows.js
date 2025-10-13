@@ -101,10 +101,10 @@ async function processAITone(bot, chatId, userId, tone) {
   const keyboard = { reply_markup: { inline_keyboard: [[{ text: "🔙 Geri Dön", callback_data: "back_to_main" }, { text: "🏠 Ana Menü", callback_data: "main_menu" }]] } };
   try {
     const processingMsg = await replaceCard(bot, chatId, userId, "Yapay zeka mail içeriğini oluşturuyor, lütfen bekleyin...", keyboard);
-    const prompt = `Aşağıdaki bilgilere göre ${tone} tonda bir email yaz:\nKonu: ${subject}\nİçerik: ${content}\nTon: ${tone}\n\nEmail'i Türkçe olarak yaz ve profesyonel bir format kullan.`;
-    const completion = await openai.chat.completions.create({ model: "gpt-3.5-turbo", messages: [{ role: "user", content: prompt }], max_tokens: 1000 });
+    const prompt = `Türkçe kısa ve net bir e-posta yaz.\nKonu: "${subject}"\nİstek: "${content}"\nTon: ${tone}\nGereksinimler: profesyonel, selamlama + gövde; imza/alt bilgi ekleme.`;
+    const completion = await openai.chat.completions.create({ model: "gpt-3.5-turbo", messages: [{ role: "user", content: prompt }], max_tokens: 400 });
     const emailContent = completion.choices[0].message.content;
-    saveUserState(userId, 'email_ready', { subject, content: emailContent, method: 'ai' });
+    saveUserState(userId, 'email_ready', { subject, content: emailContent, method: 'ai', aiBrief: content, aiTone: tone });
     const { showEmailPreview } = require('./flows');
     showEmailPreview(bot, chatId, userId, subject, emailContent, processingMsg.message_id);
   } catch (error) {
@@ -163,10 +163,13 @@ async function processTemplate(bot, chatId, userId, template) {
 async function showEmailPreview(bot, chatId, userId, subject, content) {
   const data = getUserData(userId);
   const attachments = data.attachments || [];
-  const keyboard = { reply_markup: { inline_keyboard: [
-    [{ text: "✏️ Düzenle", callback_data: "edit_email" }, { text: "📎 Dosya Ekle", callback_data: "add_attachment" }],
-    [{ text: "➡️ Alıcıları Belirle", callback_data: "set_recipients" }]
-  ] } };
+  const rows = [];
+  rows.push([{ text: "✏️ Düzenle", callback_data: "edit_email" }, { text: "📎 Dosya Ekle", callback_data: "add_attachment" }]);
+  if (data.method === 'ai') {
+    rows.push([{ text: "🔄 Yeniden Üret", callback_data: "regenerate_email" }]);
+  }
+  rows.push([{ text: "➡️ Alıcıları Belirle", callback_data: "set_recipients" }]);
+  const keyboard = { reply_markup: { inline_keyboard: rows } };
   const escSubject = escapeTelegramMarkdown(subject);
   const withFooter = applyFooterToContent(content);
   const escContent = escapeTelegramMarkdown(withFooter);
@@ -351,5 +354,30 @@ async function goBack(bot, chatId, userId) {
 }
 
 module.exports.goBack = goBack;
+
+// Regenerate AI email with the same subject/brief/tone
+module.exports.regenerateAIEmail = async function regenerateAIEmail(bot, chatId, userId) {
+  const openai = getOpenAIClient();
+  const data = getUserData(userId);
+  const subject = data.subject;
+  const brief = data.aiBrief || '';
+  const tone = data.aiTone || 'profesyonel';
+  const keyboard = { reply_markup: { inline_keyboard: [[{ text: "🔙 Geri Dön", callback_data: "back_to_main" }, { text: "🏠 Ana Menü", callback_data: "main_menu" }]] } };
+  if (!openai) {
+    await replaceCard(bot, chatId, userId, "Yapay zeka özelliği yapılandırılmamış.", keyboard);
+    return;
+  }
+  try {
+    await replaceCard(bot, chatId, userId, "Yapay zeka mail içeriğini yeniden oluşturuyor, lütfen bekleyin...", keyboard);
+    const prompt = `Türkçe kısa ve net bir e-posta yaz.\nKonu: "${subject}"\nİstek: "${brief}"\nTon: ${tone}\nGereksinimler: profesyonel, selamlama + gövde; imza/alt bilgi ekleme.`;
+    const completion = await openai.chat.completions.create({ model: "gpt-3.5-turbo", messages: [{ role: "user", content: prompt }], max_tokens: 400 });
+    const emailContent = completion.choices[0].message.content;
+    saveUserState(userId, 'email_ready', { ...data, subject, content: emailContent, method: 'ai', aiBrief: brief, aiTone: tone });
+    await module.exports.showEmailPreview(bot, chatId, userId, subject, emailContent);
+  } catch (error) {
+    console.error('OpenAI Error (regenerate):', error);
+    await replaceCard(bot, chatId, userId, "Yapay zeka ile mail yeniden oluşturulurken hata oluştu. Lütfen tekrar deneyin.", keyboard);
+  }
+};
 
 

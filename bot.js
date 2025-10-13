@@ -695,6 +695,12 @@ bot.on('callback_query', async (callbackQuery) => {
       await flows.editEmail(bot, chatId, userId);
       break;
       
+    case 'regenerate_email':
+      if (typeof flows.regenerateAIEmail === 'function') {
+        await flows.regenerateAIEmail(bot, chatId, userId);
+      }
+      break;
+
     case 'add_attachment':
       saveUserState(userId, 'waiting_attachment');
       const attachmentKeyboard = {
@@ -727,6 +733,24 @@ bot.on('callback_query', async (callbackQuery) => {
       await flows.sendEmail(bot, chatId, userId);
       break;
       
+    case 'confirm_recipients': {
+      const dataState = getUserData(userId);
+      const emails = Array.isArray(dataState?.pendingRecipients) ? dataState.pendingRecipients : [];
+      if (emails.length === 0) {
+        await flows.showRecipientOptions(bot, chatId, userId);
+        break;
+      }
+      // Temizle ve süreçte kullan
+      saveUserState(userId, 'waiting_confirm_cleanup', { ...dataState, pendingRecipients: undefined });
+      await flows.processRecipients(bot, chatId, userId, emails);
+      break;
+    }
+
+    case 'cancel_recipients':
+      // Onay ekranından vazgeçildi; alıcı belirleme seçeneklerine geri dön
+      await flows.showRecipientOptions(bot, chatId, userId);
+      break;
+
     case 'cancel':
       clearUserState(userId);
       await showMainMenu(chatId, messageId, userId);
@@ -773,8 +797,8 @@ bot.on('document', async (msg) => {
       const fileId = msg.document.file_id;
       const fileName = msg.document.file_name;
       const messageId = getUserMessage(userId);
-      
-      // Yeni mesaj gönder (kart olarak)
+
+      // İşleniyor durumunu mevcut karta yaz (yoksa yeni oluştur)
       const excelKeyboard = {
         reply_markup: {
           inline_keyboard: [
@@ -785,9 +809,16 @@ bot.on('document', async (msg) => {
           ]
         }
       };
-      
-      const processingMsg = await bot.sendMessage(chatId, "📊 Excel dosyası işleniyor, lütfen bekleyin...", excelKeyboard);
-      saveUserMessage(userId, processingMsg.message_id);
+      if (messageId) {
+        await bot.editMessageText("📊 Excel dosyası işleniyor, lütfen bekleyin...", {
+          chat_id: chatId,
+          message_id: messageId,
+          reply_markup: excelKeyboard.reply_markup
+        });
+      } else {
+        const processingMsg = await bot.sendMessage(chatId, "📊 Excel dosyası işleniyor, lütfen bekleyin...", excelKeyboard);
+        saveUserMessage(userId, processingMsg.message_id);
+      }
       
       // Dosyayı indir
       const file = await bot.getFile(fileId);
@@ -834,25 +865,29 @@ bot.on('document', async (msg) => {
         return;
       }
       
-      const successMessage = `✅ ${emails.length} mail adresi bulundu: ${emails.join(', ')}`;
+      const successList = emails.join(', ');
+      const successMessage = `✅ ${emails.length} mail adresi bulundu:\n\n${successList}`;
       const successKeyboard = {
         reply_markup: {
           inline_keyboard: [
             [
-              { text: "🔙 Geri Dön", callback_data: "back_to_main" },
-              { text: "🏠 Ana Menü", callback_data: "main_menu" }
+              { text: "✅ Onayla", callback_data: "confirm_recipients" },
+              { text: "❌ İptal", callback_data: "cancel_recipients" }
             ]
           ]
         }
       };
-      
+
+      // Onayı beklemek için geçici alıcı listesini state'e yaz
+      saveUserState(userId, 'confirm_recipients', { pendingRecipients: emails });
+
+      // Mevcut kartı güncelle (işleniyor kartı aynı kalır ve yerinde güncellenir)
+      const currentId = getUserMessage(userId);
       bot.editMessageText(successMessage, {
         chat_id: chatId,
-        message_id: messageId,
+        message_id: currentId,
         reply_markup: successKeyboard.reply_markup
       });
-      
-      flows.processRecipients(bot, chatId, userId, emails);
       
       // Geçici dosyayı sil
       if (fs.existsSync(filePath)) {
@@ -861,7 +896,22 @@ bot.on('document', async (msg) => {
       
     } catch (error) {
       console.error('Excel Error:', error);
-      bot.sendMessage(chatId, `Excel dosyası işlenirken hata oluştu: ${error.message}`);
+      const errId = getUserMessage(userId);
+      const errorMessage = `Excel dosyası işlenirken hata oluştu: ${error.message}`;
+      if (errId) {
+        bot.editMessageText(errorMessage, {
+          chat_id: chatId,
+          message_id: errId,
+          reply_markup: {
+            inline_keyboard: [[
+              { text: "🔙 Geri Dön", callback_data: "back_to_main" },
+              { text: "🏠 Ana Menü", callback_data: "main_menu" }
+            ]]
+          }
+        });
+      } else {
+        bot.sendMessage(chatId, errorMessage);
+      }
       
       // Geçici dosyayı temizle
       try {
