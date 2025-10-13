@@ -1,0 +1,31 @@
+{
+  "name": "telegram-mail-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot for creating and sending emails",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "nodemon bot.js",
+    "stop": "pkill -f 'node bot.js' || true",
+    "restart": "npm run stop && npm start"
+  },
+  "dependencies": {
+    "dotenv": "^16.3.1",
+    "multer": "^1.4.5-lts.1",
+    "node-telegram-bot-api": "^0.63.0",
+    "nodemailer": "^7.0.9",
+    "openai": "^4.20.1",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "email",
+    "ai"
+  ],
+  "author": "",
+  "license": "MIT"
+}

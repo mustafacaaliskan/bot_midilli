@@ -1,0 +1,1060 @@
+const TelegramBot = require('node-telegram-bot-api');
+const OpenAI = require('openai');
+const nodemailer = require('nodemailer');
+const XLSX = require('xlsx');
+const fs = require('fs');
+const path = require('path');
+const https = require('https');
+const http = require('http');
+const config = require('./config');
+require('dotenv').config();
+
+// Check if required environment variables are set
+function checkEnvironmentVariables() {
+  const requiredVars = [
+    'TELEGRAM_BOT_TOKEN',
+    'OPENAI_API_KEY',
+    'EMAIL_ADDRESS',
+    'EMAIL_PASSWORD',
+    'ADMIN_USER_IDS'
+  ];
+  
+  const missingVars = requiredVars.filter(varName => {
+    const value = process.env[varName] || config[varName];
+    return !value || value.includes('your_') || value.includes('_here');
+  });
+  
+  if (missingVars.length > 0) {
+    console.error('❌ Missing or invalid environment variables:');
+    missingVars.forEach(varName => {
+      console.error(`   - ${varName}`);
+    });
+    console.error('\n📝 Please create a .env file with the following variables:');
+    console.error('TELEGRAM_BOT_TOKEN=your_actual_bot_token');
+    console.error('OPENAI_API_KEY=your_actual_openai_key');
+    console.error('EMAIL_ADDRESS=your_email@gmail.com');
+    console.error('EMAIL_PASSWORD=your_app_password');
+    console.error('ADMIN_USER_IDS=your_telegram_user_id');
+    console.error('\n💡 You can copy the values from config.js as a template.');
+    process.exit(1);
+  }
+}
+
+// Check environment variables before starting
+checkEnvironmentVariables();
+
+// Bot ve OpenAI yapılandırması
+const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN || config.TELEGRAM_BOT_TOKEN, { polling: true });
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY || config.OPENAI_API_KEY,
+});
+
+// Email transporter yapılandırması
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_SERVER || config.SMTP_SERVER,
+  port: parseInt(process.env.SMTP_PORT || config.SMTP_PORT),
+  secure: false,
+  auth: {
+    user: process.env.EMAIL_ADDRESS || config.EMAIL_ADDRESS,
+    pass: process.env.EMAIL_PASSWORD || config.EMAIL_PASSWORD,
+  },
+});
+
+// Kullanıcı durumları
+const userStates = new Map();
+const userData = new Map();
+const userMessages = new Map(); // Mesaj ID'lerini takip etmek için
+
+// Mail şablonları
+const emailTemplates = {
+  meeting_reminder: {
+    subject: "Toplantı Hatırlatması",
+    content: `Merhaba,
+
+Bu mail, [TOPLANTI ADI] toplantısı için bir hatırlatmadır.
+
+Toplantı Detayları:
+- Tarih: [TARİH]
+- Saat: [SAAT]
+- Yer: [YER]
+- Konu: [KONU]
+
+Lütfen toplantıya zamanında katılım sağlayınız.
+
+İyi günler,
+[İMZA]`
+  }
+};
+
+// Yardımcı fonksiyonlar
+function isAdmin(userId) {
+  const adminIdsString = process.env.ADMIN_USER_IDS || config.ADMIN_USER_IDS;
+  const adminIds = adminIdsString.split(',').map(id => parseInt(id.trim()));
+  return adminIds.includes(userId);
+}
+
+function saveUserState(userId, state, data = {}) {
+  userStates.set(userId, state);
+  if (Object.keys(data).length > 0) {
+    userData.set(userId, { ...userData.get(userId), ...data });
+  }
+}
+
+function getUserState(userId) {
+  return userStates.get(userId);
+}
+
+function getUserData(userId) {
+  return userData.get(userId) || {};
+}
+
+function clearUserState(userId) {
+  userStates.delete(userId);
+  userData.delete(userId);
+  userMessages.delete(userId);
+}
+
+function saveUserMessage(userId, messageId) {
+  userMessages.set(userId, messageId);
+}
+
+function getUserMessage(userId) {
+  return userMessages.get(userId);
+}
+
+// Eski kartı sil ve yeni kart oluştur (sadece manuel input için)
+async function replaceCard(chatId, userId, newMessage, keyboard) {
+  const oldMessageId = getUserMessage(userId);
+  
+  // Yeni mesaj gönder
+  const newMsg = await bot.sendMessage(chatId, newMessage, keyboard);
+  saveUserMessage(userId, newMsg.message_id);
+  
+  // Eski kartı tamamen sil (sadece manuel input için)
+  if (oldMessageId) {
+    try {
+      await bot.deleteMessage(chatId, oldMessageId);
+    } catch (error) {
+      console.log('Could not delete old message:', error.message);
+    }
+  }
+  
+  return newMsg;
+}
+
+// Callback için kart güncelle (silme efekti yok)
+async function updateCard(chatId, userId, newMessage, keyboard) {
+  const messageId = getUserMessage(userId);
+  
+  if (messageId) {
+    try {
+      await bot.editMessageText(newMessage, {
+        chat_id: chatId,
+        message_id: messageId,
+        reply_markup: keyboard.reply_markup
+      });
+    } catch (error) {
+      console.log('Could not update message:', error.message);
+      // Eğer güncelleme başarısız olursa yeni mesaj gönder
+      const newMsg = await bot.sendMessage(chatId, newMessage, keyboard);
+      saveUserMessage(userId, newMsg.message_id);
+    }
+  } else {
+    // Eğer messageId yoksa yeni mesaj gönder
+    const newMsg = await bot.sendMessage(chatId, newMessage, keyboard);
+    saveUserMessage(userId, newMsg.message_id);
+  }
+}
+
+// Dosya indirme fonksiyonu
+function downloadFile(url) {
+  return new Promise((resolve, reject) => {
+    const protocol = url.startsWith('https:') ? https : http;
+    
+    protocol.get(url, (response) => {
+      if (response.statusCode !== 200) {
+        reject(new Error(`HTTP ${response.statusCode}`));
+        return;
+      }
+      
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.on('end', () => resolve(Buffer.concat(chunks)));
+      response.on('error', reject);
+    }).on('error', reject);
+  });
+}
+
+// Ana menü
+async function showMainMenu(chatId, messageId = null) {
+  const keyboard = {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "🤖 Yapay Zeka ile Oluştur", callback_data: "create_ai" }
+        ],
+        [
+          { text: "✍️ Manuel Oluştur", callback_data: "create_manual" }
+        ],
+        [
+          { text: "📋 Şablonlardan Seç", callback_data: "create_template" }
+        ]
+      ]
+    }
+  };
+  
+  const message = "Mail oluşturmak için bir yöntem seçin:";
+  
+  if (messageId) {
+    await updateCard(chatId, chatId, message, keyboard);
+  } else {
+    const msg = await bot.sendMessage(chatId, message, keyboard);
+    saveUserMessage(chatId, msg.message_id);
+  }
+}
+
+// Yapay zeka ile mail oluşturma
+async function createWithAI(chatId, userId, callbackMessageId = null) {
+  saveUserState(userId, 'ai_subject');
+  
+  const keyboard = {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "🔙 Geri Dön", callback_data: "back_to_main" },
+          { text: "🏠 Ana Menü", callback_data: "main_menu" }
+        ]
+      ]
+    }
+  };
+  
+  if (callbackMessageId) {
+    await updateCard(chatId, userId, "Mail konusunu girin:", keyboard);
+  } else {
+    const msg = await bot.sendMessage(chatId, "Mail konusunu girin:", keyboard);
+    saveUserMessage(userId, msg.message_id);
+  }
+}
+
+async function processAISubject(chatId, userId, subject) {
+  const userData = getUserData(userId);
+  saveUserState(userId, 'ai_content', { ...userData, subject });
+  
+  const keyboard = {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "🔙 Geri Dön", callback_data: "back_to_main" },
+          { text: "🏠 Ana Menü", callback_data: "main_menu" }
+        ]
+      ]
+    }
+  };
+  
+  await replaceCard(chatId, userId, "Mail içeriği hakkında kısaca ne yazmak istediğinizi belirtin:", keyboard);
+}
+
+async function processAIContent(chatId, userId, content) {
+  saveUserState(userId, 'ai_tone', { content });
+  
+  const keyboard = {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "Resmi", callback_data: "tone_formal" },
+          { text: "Samimi", callback_data: "tone_friendly" }
+        ],
+        [
+          { text: "Profesyonel", callback_data: "tone_professional" },
+          { text: "Casual", callback_data: "tone_casual" }
+        ],
+        [
+          { text: "🔙 Geri Dön", callback_data: "back_to_main" },
+          { text: "🏠 Ana Menü", callback_data: "main_menu" }
+        ]
+      ]
+    }
+  };
+  
+  await replaceCard(chatId, userId, "Mail hangi tonda yazılsın?", keyboard);
+}
+
+async function processAITone(chatId, userId, tone) {
+  const userData = getUserData(userId);
+  const { subject, content } = userData;
+  
+  const keyboard = {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "🔙 Geri Dön", callback_data: "back_to_main" },
+          { text: "🏠 Ana Menü", callback_data: "main_menu" }
+        ]
+      ]
+    }
+  };
+  
+  try {
+    const processingMsg = await replaceCard(chatId, userId, "Yapay zeka mail içeriğini oluşturuyor, lütfen bekleyin...", keyboard);
+    
+    const prompt = `Aşağıdaki bilgilere göre ${tone} tonda bir email yaz:
+Konu: ${subject}
+İçerik: ${content}
+Ton: ${tone}
+
+Email'i Türkçe olarak yaz ve profesyonel bir format kullan.`;
+    
+    const completion = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 1000,
+    });
+    
+    const emailContent = completion.choices[0].message.content;
+    saveUserState(userId, 'email_ready', { 
+      subject, 
+      content: emailContent,
+      method: 'ai'
+    });
+    
+    showEmailPreview(chatId, userId, subject, emailContent, processingMsg.message_id);
+  } catch (error) {
+    console.error('OpenAI Error:', error);
+    await replaceCard(chatId, userId, "Yapay zeka ile mail oluşturulurken hata oluştu. Lütfen tekrar deneyin.", keyboard);
+    setTimeout(() => showMainMenu(chatId, getUserMessage(userId)), 2000);
+  }
+}
+
+// Manuel mail oluşturma
+async function createManual(chatId, userId, callbackMessageId = null) {
+  saveUserState(userId, 'manual_subject');
+  
+  const keyboard = {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "🔙 Geri Dön", callback_data: "back_to_main" },
+          { text: "🏠 Ana Menü", callback_data: "main_menu" }
+        ]
+      ]
+    }
+  };
+  
+  if (callbackMessageId) {
+    await updateCard(chatId, userId, "Mail konusunu girin:", keyboard);
+  } else {
+    const msg = await bot.sendMessage(chatId, "Mail konusunu girin:", keyboard);
+    saveUserMessage(userId, msg.message_id);
+  }
+}
+
+async function processManualSubject(chatId, userId, subject) {
+  const userData = getUserData(userId);
+  saveUserState(userId, 'manual_content', { ...userData, subject });
+  
+  const keyboard = {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "🔙 Geri Dön", callback_data: "back_to_main" },
+          { text: "🏠 Ana Menü", callback_data: "main_menu" }
+        ]
+      ]
+    }
+  };
+  
+  await replaceCard(chatId, userId, "Mail içeriğini girin:", keyboard);
+}
+
+async function processManualContent(chatId, userId, content) {
+  const userData = getUserData(userId);
+  const { subject } = userData;
+  
+  saveUserState(userId, 'email_ready', { 
+    subject, 
+    content,
+    method: 'manual'
+  });
+  
+  await showEmailPreview(chatId, userId, subject, content);
+}
+
+// Şablon seçimi
+async function showTemplates(chatId, userId, messageId = null) {
+  const keyboard = {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "📅 Toplantı Hatırlatması", callback_data: "template_meeting_reminder" }
+        ]
+      ]
+    }
+  };
+  
+  const message = "Hangi şablonu kullanmak istiyorsunuz?";
+  
+  if (messageId) {
+    await updateCard(chatId, userId, message, keyboard);
+  } else {
+    const msg = await bot.sendMessage(chatId, message, keyboard);
+    saveUserMessage(userId, msg.message_id);
+  }
+}
+
+async function processTemplate(chatId, userId, templateKey) {
+  const template = emailTemplates[templateKey];
+  if (template) {
+    saveUserState(userId, 'email_ready', { 
+      subject: template.subject, 
+      content: template.content,
+      method: 'template'
+    });
+    
+    await showEmailPreview(chatId, userId, template.subject, template.content);
+  }
+}
+
+// Mail önizleme
+async function showEmailPreview(chatId, userId, subject, content) {
+  const userData = getUserData(userId);
+  const attachments = userData.attachments || [];
+  
+  const keyboard = {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "✏️ Düzenle", callback_data: "edit_email" },
+          { text: "📎 Dosya Ekle", callback_data: "add_attachment" }
+        ],
+        [
+          { text: "➡️ Alıcıları Belirle", callback_data: "set_recipients" }
+        ]
+      ]
+    }
+  };
+  
+  let preview = `📧 **Mail Önizlemesi**
+
+**Konu:** ${subject}
+
+**İçerik:**
+${content}`;
+
+  if (attachments.length > 0) {
+    preview += `\n\n**📎 Eklenen Dosyalar:**\n${attachments.map((file, index) => `${index + 1}. ${file.name}`).join('\n')}`;
+  }
+
+  preview += `\n\nMail hazır! Ne yapmak istiyorsunuz?`;
+  
+  await replaceCard(chatId, userId, preview, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+}
+
+// Mail düzenleme
+async function editEmail(chatId, userId) {
+  const userData = getUserData(userId);
+  saveUserState(userId, 'editing_email');
+  
+  const message = `Mevcut mail içeriği:\n\n${userData.content}\n\nDüzenlenmiş içeriği gönderin:`;
+  
+  const keyboard = {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "🔙 Geri Dön", callback_data: "back_to_main" },
+          { text: "🏠 Ana Menü", callback_data: "main_menu" }
+        ]
+      ]
+    }
+  };
+  
+  await replaceCard(chatId, userId, message, keyboard);
+}
+
+async function processEditedEmail(chatId, userId, newContent) {
+  const userData = getUserData(userId);
+  saveUserState(userId, 'email_ready', { 
+    ...userData, 
+    content: newContent 
+  });
+  
+  await showEmailPreview(chatId, userId, userData.subject, newContent);
+}
+
+// Alıcı belirleme
+async function showRecipientOptions(chatId, userId) {
+  const keyboard = {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "📊 Excel ile Toplu", callback_data: "recipients_excel" }
+        ],
+        [
+          { text: "✍️ Manuel Gir", callback_data: "recipients_manual" }
+        ]
+      ]
+    }
+  };
+  
+  const message = "Alıcıları nasıl belirlemek istiyorsunuz?";
+  
+  await replaceCard(chatId, userId, message, keyboard);
+}
+
+async function processExcelRecipients(chatId, userId) {
+  saveUserState(userId, 'waiting_excel');
+  
+  const message = "Excel dosyasını gönderin. Dosyada ilk sütundaki ikinci satırdan itibaren mail adresleri olmalı.";
+  
+  const keyboard = {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "🔙 Geri Dön", callback_data: "back_to_main" },
+          { text: "🏠 Ana Menü", callback_data: "main_menu" }
+        ]
+      ]
+    }
+  };
+  
+  await replaceCard(chatId, userId, message, keyboard);
+}
+
+async function processManualRecipients(chatId, userId) {
+  saveUserState(userId, 'manual_recipients');
+  
+  const message = "Mail adreslerini alt alta yazın (her satıra bir mail adresi):";
+  
+  const keyboard = {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "🔙 Geri Dön", callback_data: "back_to_main" },
+          { text: "🏠 Ana Menü", callback_data: "main_menu" }
+        ]
+      ]
+    }
+  };
+  
+  await replaceCard(chatId, userId, message, keyboard);
+}
+
+async function processRecipients(chatId, userId, recipients) {
+  const userData = getUserData(userId);
+  saveUserState(userId, 'ready_to_send', { 
+    ...userData, 
+    recipients 
+  });
+  
+  await showFinalPreview(chatId, userId);
+}
+
+async function showFinalPreview(chatId, userId) {
+  const userData = getUserData(userId);
+  const { subject, content, recipients } = userData;
+  
+  const preview = `📧 **Son Mail Önizlemesi**
+
+**Konu:** ${subject}
+
+**Alıcılar:** ${recipients.join(', ')}
+
+**İçerik:**
+${content}
+
+Maili göndermek istiyor musunuz?`;
+  
+  const keyboard = {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "✅ Gönder", callback_data: "send_email" },
+          { text: "❌ İptal", callback_data: "cancel" }
+        ]
+      ]
+    }
+  };
+  
+  await replaceCard(chatId, userId, preview, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
+}
+
+// Mail gönderme
+async function sendEmail(chatId, userId) {
+  const userData = getUserData(userId);
+  const { subject, content, recipients, attachments = [] } = userData;
+  const messageId = getUserMessage(userId);
+  
+  const keyboard = {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "🔙 Geri Dön", callback_data: "back_to_main" },
+          { text: "🏠 Ana Menü", callback_data: "main_menu" }
+        ]
+      ]
+    }
+  };
+  
+  try {
+    bot.editMessageText("Mail gönderiliyor...", {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: keyboard.reply_markup
+    });
+    
+    const mailOptions = {
+      from: process.env.EMAIL_ADDRESS || config.EMAIL_ADDRESS,
+      to: recipients.join(', '),
+      subject: subject,
+      text: content,
+    };
+    
+    // Ek dosyalar varsa ekle
+    if (attachments.length > 0) {
+      mailOptions.attachments = attachments.map(file => ({
+        filename: file.name,
+        content: file.content,
+        contentType: file.mimeType
+      }));
+    }
+    
+    await transporter.sendMail(mailOptions);
+    
+    bot.editMessageText(`✅ Mail başarıyla gönderildi!\n\nAlıcılar: ${recipients.join(', ')}`, {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: keyboard.reply_markup
+    });
+    
+    clearUserState(userId);
+    
+    // Kısa bir gecikme sonrası ana menüyü göster
+    setTimeout(() => {
+      showMainMenu(chatId, messageId);
+    }, 2000);
+    
+  } catch (error) {
+    console.error('Email Error:', error);
+    bot.editMessageText("Mail gönderilirken hata oluştu. Lütfen tekrar deneyin.", {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: keyboard.reply_markup
+    });
+  }
+}
+
+// Event handlers
+bot.on('message', async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const text = msg.text;
+  
+  console.log('Message received:', { userId, text, chatId });
+  
+  // Admin kontrolü
+  if (!isAdmin(userId)) {
+    bot.sendMessage(chatId, "Bu botu kullanma yetkiniz yok.");
+    return;
+  }
+  
+  const state = getUserState(userId);
+  console.log('User state:', state);
+  
+  if (text === '/start') {
+    clearUserState(userId);
+    showMainMenu(chatId);
+    return;
+  }
+  
+  switch (state) {
+    case 'ai_subject':
+      console.log('Processing AI subject:', text);
+      await processAISubject(chatId, userId, text);
+      break;
+      
+    case 'ai_content':
+      console.log('Processing AI content:', text);
+      await processAIContent(chatId, userId, text);
+      break;
+      
+    case 'manual_subject':
+      console.log('Processing manual subject:', text);
+      await processManualSubject(chatId, userId, text);
+      break;
+      
+    case 'manual_content':
+      console.log('Processing manual content:', text);
+      await processManualContent(chatId, userId, text);
+      break;
+      
+    case 'editing_email':
+      console.log('Processing edited email:', text);
+      await processEditedEmail(chatId, userId, text);
+      break;
+      
+    case 'manual_recipients':
+      console.log('Processing manual recipients:', text);
+      const recipients = text.split('\n').map(email => email.trim()).filter(email => email);
+      await processRecipients(chatId, userId, recipients);
+      break;
+      
+    case 'waiting_attachment':
+      console.log('Waiting for attachment, but got text:', text);
+      // Bu durumda kullanıcı dosya göndermiş olmalı, document handler'da işlenecek
+      break;
+      
+    default:
+      console.log('No matching state for:', state);
+      break;
+  }
+});
+
+bot.on('callback_query', async (callbackQuery) => {
+  const chatId = callbackQuery.message.chat.id;
+  const userId = callbackQuery.from.id;
+  const messageId = callbackQuery.message.message_id;
+  const data = callbackQuery.data;
+  
+  // Admin kontrolü
+  if (!isAdmin(userId)) {
+    bot.answerCallbackQuery(callbackQuery.id, "Bu botu kullanma yetkiniz yok.");
+    return;
+  }
+  
+  // Mesaj ID'sini kaydet
+  saveUserMessage(userId, messageId);
+  
+  switch (data) {
+    case 'create_ai':
+      await createWithAI(chatId, userId, messageId);
+      break;
+      
+    case 'create_manual':
+      await createManual(chatId, userId, messageId);
+      break;
+      
+    case 'create_template':
+      await showTemplates(chatId, userId, messageId);
+      break;
+      
+    case 'template_meeting_reminder':
+      await processTemplate(chatId, userId, 'meeting_reminder');
+      break;
+      
+    case 'tone_formal':
+      await processAITone(chatId, userId, 'resmi');
+      break;
+      
+    case 'tone_friendly':
+      await processAITone(chatId, userId, 'samimi');
+      break;
+      
+    case 'tone_professional':
+      await processAITone(chatId, userId, 'profesyonel');
+      break;
+      
+    case 'tone_casual':
+      await processAITone(chatId, userId, 'casual');
+      break;
+      
+    case 'edit_email':
+      await editEmail(chatId, userId);
+      break;
+      
+    case 'add_attachment':
+      saveUserState(userId, 'waiting_attachment');
+      const attachmentKeyboard = {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "🔙 Geri Dön", callback_data: "back_to_main" },
+              { text: "🏠 Ana Menü", callback_data: "main_menu" }
+            ]
+          ]
+        }
+      };
+      
+      await updateCard(chatId, userId, "📎 Eklenecek dosyayı gönderin (resim, PDF, Word, Excel vb.):", attachmentKeyboard);
+      break;
+      
+    case 'set_recipients':
+      await showRecipientOptions(chatId, userId);
+      break;
+      
+    case 'recipients_excel':
+      await processExcelRecipients(chatId, userId);
+      break;
+      
+    case 'recipients_manual':
+      await processManualRecipients(chatId, userId);
+      break;
+      
+    case 'send_email':
+      await sendEmail(chatId, userId);
+      break;
+      
+    case 'cancel':
+      clearUserState(userId);
+      await showMainMenu(chatId, messageId);
+      break;
+      
+    case 'back_to_main':
+      await showMainMenu(chatId, messageId);
+      break;
+      
+    case 'main_menu':
+      clearUserState(userId);
+      await showMainMenu(chatId, messageId);
+      break;
+  }
+  
+  bot.answerCallbackQuery(callbackQuery.id);
+});
+
+// Dosya işleme (Excel ve ek dosyalar)
+bot.on('document', async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const state = getUserState(userId);
+  
+  console.log('Document received:', {
+    userId,
+    state,
+    fileName: msg.document?.file_name,
+    fileId: msg.document?.file_id
+  });
+  
+  // Admin kontrolü
+  if (!isAdmin(userId)) {
+    bot.sendMessage(chatId, "Bu botu kullanma yetkiniz yok.");
+    return;
+  }
+  
+  if (state === 'waiting_excel') {
+    try {
+      const fileId = msg.document.file_id;
+      const fileName = msg.document.file_name;
+      const messageId = getUserMessage(userId);
+      
+      // Yeni mesaj gönder (kart olarak)
+      const excelKeyboard = {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "🔙 Geri Dön", callback_data: "back_to_main" },
+              { text: "🏠 Ana Menü", callback_data: "main_menu" }
+            ]
+          ]
+        }
+      };
+      
+      const processingMsg = await bot.sendMessage(chatId, "📊 Excel dosyası işleniyor, lütfen bekleyin...", excelKeyboard);
+      saveUserMessage(userId, processingMsg.message_id);
+      
+      // Dosyayı indir
+      const file = await bot.getFile(fileId);
+      const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+      
+      // Dosyayı indir
+      const fileContent = await downloadFile(fileUrl);
+      const filePath = `./temp_${Date.now()}_${fileName}`;
+      
+      // Dosyayı disk'e yaz
+      fs.writeFileSync(filePath, fileContent);
+      
+      // Excel dosyasını oku
+      const workbook = XLSX.readFile(filePath);
+      const sheetName = workbook.SheetNames[0];
+      const worksheet = workbook.Sheets[sheetName];
+      const data = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+      
+      // İlk sütundaki ikinci satırdan itibaren mail adreslerini al
+      const emails = data.slice(1).map(row => row[0]).filter(email => email && email.includes('@'));
+      
+      if (emails.length === 0) {
+        const errorMessage = "Excel dosyasında geçerli mail adresi bulunamadı. Lütfen ilk sütunda mail adreslerinin olduğundan emin olun.";
+        const keyboard = {
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: "🔙 Geri Dön", callback_data: "back_to_main" },
+                { text: "🏠 Ana Menü", callback_data: "main_menu" }
+              ]
+            ]
+          }
+        };
+        
+        bot.editMessageText(errorMessage, {
+          chat_id: chatId,
+          message_id: messageId,
+          reply_markup: keyboard.reply_markup
+        });
+        // Geçici dosyayı sil
+        if (fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+        }
+        return;
+      }
+      
+      const successMessage = `✅ ${emails.length} mail adresi bulundu: ${emails.join(', ')}`;
+      const successKeyboard = {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "🔙 Geri Dön", callback_data: "back_to_main" },
+              { text: "🏠 Ana Menü", callback_data: "main_menu" }
+            ]
+          ]
+        }
+      };
+      
+      bot.editMessageText(successMessage, {
+        chat_id: chatId,
+        message_id: messageId,
+        reply_markup: successKeyboard.reply_markup
+      });
+      
+      processRecipients(chatId, userId, emails);
+      
+      // Geçici dosyayı sil
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+      
+    } catch (error) {
+      console.error('Excel Error:', error);
+      bot.sendMessage(chatId, `Excel dosyası işlenirken hata oluştu: ${error.message}`);
+      
+      // Geçici dosyayı temizle
+      try {
+        const filePath = `./temp_${Date.now()}_${msg.document.file_name}`;
+        if (fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+        }
+      } catch (cleanupError) {
+        console.error('Cleanup Error:', cleanupError);
+      }
+    }
+  } else if (state === 'waiting_attachment') {
+    try {
+      const fileId = msg.document.file_id;
+      const fileName = msg.document.file_name;
+      const mimeType = msg.document.mime_type;
+      const messageId = getUserMessage(userId);
+      
+      console.log('Processing attachment:', { fileName, mimeType, fileId });
+      
+      // Yeni mesaj gönder (kart olarak)
+      const attachmentKeyboard = {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "🔙 Geri Dön", callback_data: "back_to_main" },
+              { text: "🏠 Ana Menü", callback_data: "main_menu" }
+            ]
+          ]
+        }
+      };
+      
+      const processingMsg = await bot.sendMessage(chatId, "📎 Dosya işleniyor, lütfen bekleyin...", attachmentKeyboard);
+      saveUserMessage(userId, processingMsg.message_id);
+      
+      // Dosyayı indir
+      const file = await bot.getFile(fileId);
+      const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+      
+      console.log('Downloading file from:', fileUrl);
+      
+      // Dosyayı https ile indir
+      const fileContent = await downloadFile(fileUrl);
+      
+      console.log('File downloaded, size:', fileContent.length);
+      
+      // Kullanıcı verilerine ek dosyayı ekle
+      const userData = getUserData(userId);
+      const attachments = userData.attachments || [];
+      
+      attachments.push({
+        name: fileName,
+        content: fileContent,
+        mimeType: mimeType
+      });
+      
+      saveUserState(userId, 'email_ready', { 
+        ...userData, 
+        attachments 
+      });
+      
+      // Başarı mesajı gönder ve mail önizlemesini güncelle
+      const fileSuccessKeyboard = {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "🔙 Geri Dön", callback_data: "back_to_main" },
+              { text: "🏠 Ana Menü", callback_data: "main_menu" }
+            ]
+          ]
+        }
+      };
+      
+      bot.editMessageText(`✅ Dosya başarıyla eklendi: ${fileName}`, {
+        chat_id: chatId,
+        message_id: messageId,
+        reply_markup: fileSuccessKeyboard.reply_markup
+      });
+      
+      // Kısa bir gecikme sonrası mail önizlemesini göster
+      setTimeout(() => {
+        showEmailPreview(chatId, userId, userData.subject, userData.content, messageId);
+      }, 1000);
+      
+    } catch (error) {
+      console.error('Attachment Error:', error);
+      const errorMessage = `Dosya işlenirken hata oluştu: ${error.message}`;
+      const keyboard = {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "🔙 Geri Dön", callback_data: "back_to_main" },
+              { text: "🏠 Ana Menü", callback_data: "main_menu" }
+            ]
+          ]
+        }
+      };
+      
+      bot.editMessageText(errorMessage, {
+        chat_id: chatId,
+        message_id: messageId,
+        reply_markup: keyboard.reply_markup
+      });
+    }
+  } else {
+    console.log('No matching state for document:', state);
+    const messageId = getUserMessage(userId);
+    const message = "Dosya göndermek için önce '📎 Dosya Ekle' butonuna basın.";
+    
+    const keyboard = {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "🔙 Geri Dön", callback_data: "back_to_main" },
+            { text: "🏠 Ana Menü", callback_data: "main_menu" }
+          ]
+        ]
+      }
+    };
+    
+    if (messageId) {
+      bot.editMessageText(message, {
+        chat_id: chatId,
+        message_id: messageId,
+        reply_markup: keyboard.reply_markup
+      });
+    } else {
+      bot.sendMessage(chatId, message, keyboard);
+    }
+  }
+});
+
+console.log('Telegram Mail Bot başlatıldı...');
+console.log('⚠️  UYARI: Bu bot asla arka planda çalıştırılmamalıdır!');
+console.log('📝 Botu durdurmak için: Ctrl+C veya npm run stop');
