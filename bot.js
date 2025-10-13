@@ -1,26 +1,34 @@
 const TelegramBot = require('node-telegram-bot-api');
-const OpenAI = require('openai');
-const nodemailer = require('nodemailer');
 const XLSX = require('xlsx');
 const fs = require('fs');
-const path = require('path');
-const https = require('https');
-const http = require('http');
 const config = require('./config');
+const ui = require('./ui');
+const flows = require('./flows');
 require('dotenv').config();
+const {
+  saveUserState,
+  getUserState,
+  getUserData,
+  clearUserState,
+  saveUserMessage,
+  getUserMessage,
+  setLastInteraction,
+  getLastInteraction,
+} = require('./state');
+const { handleAttachment } = require('./attachments');
+const { downloadFile } = require('./utils');
 
 // Check if required environment variables are set
 function checkEnvironmentVariables() {
   const requiredVars = [
     'TELEGRAM_BOT_TOKEN',
-    'OPENAI_API_KEY',
     'EMAIL_ADDRESS',
     'EMAIL_PASSWORD',
     'ADMIN_USER_IDS'
   ];
   
   const missingVars = requiredVars.filter(varName => {
-    const value = process.env[varName] || config[varName];
+    const value = process.env[varName];
     return !value || value.includes('your_') || value.includes('_here');
   });
   
@@ -31,7 +39,7 @@ function checkEnvironmentVariables() {
     });
     console.error('\n📝 Please create a .env file with the following variables:');
     console.error('TELEGRAM_BOT_TOKEN=your_actual_bot_token');
-    console.error('OPENAI_API_KEY=your_actual_openai_key');
+    console.error('OPENAI_API_KEY=sk_your_actual_openai_key');
     console.error('EMAIL_ADDRESS=your_email@gmail.com');
     console.error('EMAIL_PASSWORD=your_app_password');
     console.error('ADMIN_USER_IDS=your_telegram_user_id');
@@ -43,27 +51,10 @@ function checkEnvironmentVariables() {
 // Check environment variables before starting
 checkEnvironmentVariables();
 
-// Bot ve OpenAI yapılandırması
+// Bot yapılandırması
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN || config.TELEGRAM_BOT_TOKEN, { polling: true });
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY || config.OPENAI_API_KEY,
-});
 
-// Email transporter yapılandırması
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_SERVER || config.SMTP_SERVER,
-  port: parseInt(process.env.SMTP_PORT || config.SMTP_PORT),
-  secure: false,
-  auth: {
-    user: process.env.EMAIL_ADDRESS || config.EMAIL_ADDRESS,
-    pass: process.env.EMAIL_PASSWORD || config.EMAIL_PASSWORD,
-  },
-});
-
-// Kullanıcı durumları
-const userStates = new Map();
-const userData = new Map();
-const userMessages = new Map(); // Mesaj ID'lerini takip etmek için
+// State is managed in ./state
 
 // Mail şablonları
 const emailTemplates = {
@@ -93,44 +84,20 @@ function isAdmin(userId) {
   return adminIds.includes(userId);
 }
 
-function saveUserState(userId, state, data = {}) {
-  userStates.set(userId, state);
-  if (Object.keys(data).length > 0) {
-    userData.set(userId, { ...userData.get(userId), ...data });
-  }
-}
-
-function getUserState(userId) {
-  return userStates.get(userId);
-}
-
-function getUserData(userId) {
-  return userData.get(userId) || {};
-}
-
-function clearUserState(userId) {
-  userStates.delete(userId);
-  userData.delete(userId);
-  userMessages.delete(userId);
-}
-
-function saveUserMessage(userId, messageId) {
-  userMessages.set(userId, messageId);
-}
-
-function getUserMessage(userId) {
-  return userMessages.get(userId);
-}
+// State helpers imported from ./state
 
 // Eski kartı sil ve yeni kart oluştur (sadece manuel input için)
-async function replaceCard(chatId, userId, newMessage, keyboard) {
+async function replaceCard(chatId, userId, newMessage, options) {
   const oldMessageId = getUserMessage(userId);
-  
-  // Yeni mesaj gönder
-  const newMsg = await bot.sendMessage(chatId, newMessage, keyboard);
-  saveUserMessage(userId, newMsg.message_id);
-  
-  // Eski kartı tamamen sil (sadece manuel input için)
+  const last = getLastInteraction(userId);
+
+  // Eğer son etkileşim callback ise, silme yerine güncelle (silme efekti yok)
+  if (last === 'callback' && oldMessageId) {
+    await ui.updateCard(bot, chatId, userId, newMessage, options);
+    return { message_id: getUserMessage(userId) };
+  }
+
+  // Son etkileşim kullanıcı mesajı ise: eskiyi sil, yenisini gönder
   if (oldMessageId) {
     try {
       await bot.deleteMessage(chatId, oldMessageId);
@@ -138,79 +105,42 @@ async function replaceCard(chatId, userId, newMessage, keyboard) {
       console.log('Could not delete old message:', error.message);
     }
   }
-  
+
+  const newMsg = await bot.sendMessage(chatId, newMessage, options);
+  saveUserMessage(userId, newMsg.message_id);
   return newMsg;
 }
 
 // Callback için kart güncelle (silme efekti yok)
-async function updateCard(chatId, userId, newMessage, keyboard) {
+async function updateCard(chatId, userId, newMessage, options) {
   const messageId = getUserMessage(userId);
-  
+
   if (messageId) {
     try {
-      await bot.editMessageText(newMessage, {
-        chat_id: chatId,
-        message_id: messageId,
-        reply_markup: keyboard.reply_markup
-      });
+      await bot.editMessageText(newMessage, { chat_id: chatId, message_id: messageId, ...(options || {}) });
     } catch (error) {
       console.log('Could not update message:', error.message);
-      // Eğer güncelleme başarısız olursa yeni mesaj gönder
-      const newMsg = await bot.sendMessage(chatId, newMessage, keyboard);
+      // Eğer güncelleme başarısız olursa yeni mesaj gönder ve eskiyi sil
+      const newMsg = await bot.sendMessage(chatId, newMessage, options);
       saveUserMessage(userId, newMsg.message_id);
+      try {
+        await bot.deleteMessage(chatId, messageId);
+      } catch (delErr) {
+        console.log('Could not delete stale message after failed edit:', delErr.message);
+      }
     }
   } else {
     // Eğer messageId yoksa yeni mesaj gönder
-    const newMsg = await bot.sendMessage(chatId, newMessage, keyboard);
+    const newMsg = await bot.sendMessage(chatId, newMessage, options);
     saveUserMessage(userId, newMsg.message_id);
   }
 }
 
-// Dosya indirme fonksiyonu
-function downloadFile(url) {
-  return new Promise((resolve, reject) => {
-    const protocol = url.startsWith('https:') ? https : http;
-    
-    protocol.get(url, (response) => {
-      if (response.statusCode !== 200) {
-        reject(new Error(`HTTP ${response.statusCode}`));
-        return;
-      }
-      
-      const chunks = [];
-      response.on('data', (chunk) => chunks.push(chunk));
-      response.on('end', () => resolve(Buffer.concat(chunks)));
-      response.on('error', reject);
-    }).on('error', reject);
-  });
-}
+// downloadFile imported from ./utils
 
 // Ana menü
-async function showMainMenu(chatId, messageId = null) {
-  const keyboard = {
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "🤖 Yapay Zeka ile Oluştur", callback_data: "create_ai" }
-        ],
-        [
-          { text: "✍️ Manuel Oluştur", callback_data: "create_manual" }
-        ],
-        [
-          { text: "📋 Şablonlardan Seç", callback_data: "create_template" }
-        ]
-      ]
-    }
-  };
-  
-  const message = "Mail oluşturmak için bir yöntem seçin:";
-  
-  if (messageId) {
-    await updateCard(chatId, chatId, message, keyboard);
-  } else {
-    const msg = await bot.sendMessage(chatId, message, keyboard);
-    saveUserMessage(chatId, msg.message_id);
-  }
+async function showMainMenu(chatId, messageId = null, userId = null) {
+  return ui.showMainMenu(bot, chatId, userId, messageId);
 }
 
 // Yapay zeka ile mail oluşturma
@@ -321,7 +251,7 @@ Email'i Türkçe olarak yaz ve profesyonel bir format kullan.`;
   } catch (error) {
     console.error('OpenAI Error:', error);
     await replaceCard(chatId, userId, "Yapay zeka ile mail oluşturulurken hata oluştu. Lütfen tekrar deneyin.", keyboard);
-    setTimeout(() => showMainMenu(chatId, getUserMessage(userId)), 2000);
+    setTimeout(() => showMainMenu(chatId, getUserMessage(userId), userId), 2000);
   }
 }
 
@@ -629,7 +559,7 @@ async function sendEmail(chatId, userId) {
     
     // Kısa bir gecikme sonrası ana menüyü göster
     setTimeout(() => {
-      showMainMenu(chatId, messageId);
+      showMainMenu(chatId, messageId, userId);
     }, 2000);
     
   } catch (error) {
@@ -661,40 +591,43 @@ bot.on('message', async (msg) => {
   
   if (text === '/start') {
     clearUserState(userId);
-    showMainMenu(chatId);
+    showMainMenu(chatId, null, userId);
     return;
   }
   
+  // Son etkileşim: kullanıcı mesajı
+  setLastInteraction(userId, 'message');
+
   switch (state) {
     case 'ai_subject':
       console.log('Processing AI subject:', text);
-      await processAISubject(chatId, userId, text);
+      await flows.processAISubject(bot, chatId, userId, text);
       break;
       
     case 'ai_content':
       console.log('Processing AI content:', text);
-      await processAIContent(chatId, userId, text);
+      await flows.processAIContent(bot, chatId, userId, text);
       break;
       
     case 'manual_subject':
       console.log('Processing manual subject:', text);
-      await processManualSubject(chatId, userId, text);
+      await flows.processManualSubject(bot, chatId, userId, text);
       break;
       
     case 'manual_content':
       console.log('Processing manual content:', text);
-      await processManualContent(chatId, userId, text);
+      await flows.processManualContent(bot, chatId, userId, text);
       break;
       
     case 'editing_email':
       console.log('Processing edited email:', text);
-      await processEditedEmail(chatId, userId, text);
+      await flows.processEditedEmail(bot, chatId, userId, text);
       break;
       
     case 'manual_recipients':
       console.log('Processing manual recipients:', text);
       const recipients = text.split('\n').map(email => email.trim()).filter(email => email);
-      await processRecipients(chatId, userId, recipients);
+      await flows.processRecipients(bot, chatId, userId, recipients);
       break;
       
     case 'waiting_attachment':
@@ -720,44 +653,46 @@ bot.on('callback_query', async (callbackQuery) => {
     return;
   }
   
+  // Son etkileşim: callback
+  setLastInteraction(userId, 'callback');
   // Mesaj ID'sini kaydet
   saveUserMessage(userId, messageId);
   
   switch (data) {
     case 'create_ai':
-      await createWithAI(chatId, userId, messageId);
+      await flows.createWithAI(bot, chatId, userId, messageId);
       break;
       
     case 'create_manual':
-      await createManual(chatId, userId, messageId);
+      await flows.createManual(bot, chatId, userId, messageId);
       break;
       
     case 'create_template':
-      await showTemplates(chatId, userId, messageId);
+      await flows.showTemplates(bot, chatId, userId, messageId);
       break;
       
     case 'template_meeting_reminder':
-      await processTemplate(chatId, userId, 'meeting_reminder');
+      await flows.processTemplate(bot, chatId, userId, emailTemplates['meeting_reminder']);
       break;
       
     case 'tone_formal':
-      await processAITone(chatId, userId, 'resmi');
+      await flows.processAITone(bot, chatId, userId, 'resmi');
       break;
       
     case 'tone_friendly':
-      await processAITone(chatId, userId, 'samimi');
+      await flows.processAITone(bot, chatId, userId, 'samimi');
       break;
       
     case 'tone_professional':
-      await processAITone(chatId, userId, 'profesyonel');
+      await flows.processAITone(bot, chatId, userId, 'profesyonel');
       break;
       
     case 'tone_casual':
-      await processAITone(chatId, userId, 'casual');
+      await flows.processAITone(bot, chatId, userId, 'casual');
       break;
       
     case 'edit_email':
-      await editEmail(chatId, userId);
+      await flows.editEmail(bot, chatId, userId);
       break;
       
     case 'add_attachment':
@@ -773,37 +708,37 @@ bot.on('callback_query', async (callbackQuery) => {
         }
       };
       
-      await updateCard(chatId, userId, "📎 Eklenecek dosyayı gönderin (resim, PDF, Word, Excel vb.):", attachmentKeyboard);
+      await ui.updateCard(bot, chatId, userId, "📎 Eklenecek dosyayı gönderin (resim, PDF, Word, Excel vb.):", attachmentKeyboard);
       break;
       
     case 'set_recipients':
-      await showRecipientOptions(chatId, userId);
+      await flows.showRecipientOptions(bot, chatId, userId);
       break;
       
     case 'recipients_excel':
-      await processExcelRecipients(chatId, userId);
+      await flows.processExcelRecipients(bot, chatId, userId);
       break;
       
     case 'recipients_manual':
-      await processManualRecipients(chatId, userId);
+      await flows.processManualRecipients(bot, chatId, userId);
       break;
       
     case 'send_email':
-      await sendEmail(chatId, userId);
+      await flows.sendEmail(bot, chatId, userId);
       break;
       
     case 'cancel':
       clearUserState(userId);
-      await showMainMenu(chatId, messageId);
+      await showMainMenu(chatId, messageId, userId);
       break;
       
     case 'back_to_main':
-      await showMainMenu(chatId, messageId);
+      await showMainMenu(chatId, messageId, userId);
       break;
       
     case 'main_menu':
       clearUserState(userId);
-      await showMainMenu(chatId, messageId);
+      await showMainMenu(chatId, messageId, userId);
       break;
   }
   
@@ -913,7 +848,7 @@ bot.on('document', async (msg) => {
         reply_markup: successKeyboard.reply_markup
       });
       
-      processRecipients(chatId, userId, emails);
+      flows.processRecipients(bot, chatId, userId, emails);
       
       // Geçici dosyayı sil
       if (fs.existsSync(filePath)) {
@@ -939,93 +874,9 @@ bot.on('document', async (msg) => {
       const fileId = msg.document.file_id;
       const fileName = msg.document.file_name;
       const mimeType = msg.document.mime_type;
-      const messageId = getUserMessage(userId);
-      
-      console.log('Processing attachment:', { fileName, mimeType, fileId });
-      
-      // Yeni mesaj gönder (kart olarak)
-      const attachmentKeyboard = {
-        reply_markup: {
-          inline_keyboard: [
-            [
-              { text: "🔙 Geri Dön", callback_data: "back_to_main" },
-              { text: "🏠 Ana Menü", callback_data: "main_menu" }
-            ]
-          ]
-        }
-      };
-      
-      const processingMsg = await bot.sendMessage(chatId, "📎 Dosya işleniyor, lütfen bekleyin...", attachmentKeyboard);
-      saveUserMessage(userId, processingMsg.message_id);
-      
-      // Dosyayı indir
-      const file = await bot.getFile(fileId);
-      const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
-      
-      console.log('Downloading file from:', fileUrl);
-      
-      // Dosyayı https ile indir
-      const fileContent = await downloadFile(fileUrl);
-      
-      console.log('File downloaded, size:', fileContent.length);
-      
-      // Kullanıcı verilerine ek dosyayı ekle
-      const userData = getUserData(userId);
-      const attachments = userData.attachments || [];
-      
-      attachments.push({
-        name: fileName,
-        content: fileContent,
-        mimeType: mimeType
-      });
-      
-      saveUserState(userId, 'email_ready', { 
-        ...userData, 
-        attachments 
-      });
-      
-      // Başarı mesajı gönder ve mail önizlemesini güncelle
-      const fileSuccessKeyboard = {
-        reply_markup: {
-          inline_keyboard: [
-            [
-              { text: "🔙 Geri Dön", callback_data: "back_to_main" },
-              { text: "🏠 Ana Menü", callback_data: "main_menu" }
-            ]
-          ]
-        }
-      };
-      
-      bot.editMessageText(`✅ Dosya başarıyla eklendi: ${fileName}`, {
-        chat_id: chatId,
-        message_id: messageId,
-        reply_markup: fileSuccessKeyboard.reply_markup
-      });
-      
-      // Kısa bir gecikme sonrası mail önizlemesini göster
-      setTimeout(() => {
-        showEmailPreview(chatId, userId, userData.subject, userData.content, messageId);
-      }, 1000);
-      
+      await handleAttachment(bot, chatId, userId, downloadFile, { fileId, fileName, mimeType });
     } catch (error) {
-      console.error('Attachment Error:', error);
-      const errorMessage = `Dosya işlenirken hata oluştu: ${error.message}`;
-      const keyboard = {
-        reply_markup: {
-          inline_keyboard: [
-            [
-              { text: "🔙 Geri Dön", callback_data: "back_to_main" },
-              { text: "🏠 Ana Menü", callback_data: "main_menu" }
-            ]
-          ]
-        }
-      };
-      
-      bot.editMessageText(errorMessage, {
-        chat_id: chatId,
-        message_id: messageId,
-        reply_markup: keyboard.reply_markup
-      });
+      console.error('Attachment Error (document):', error);
     }
   } else {
     console.log('No matching state for document:', state);
@@ -1052,6 +903,63 @@ bot.on('document', async (msg) => {
     } else {
       bot.sendMessage(chatId, message, keyboard);
     }
+  }
+});
+
+// Attachment helpers imported from ./attachments
+
+// Fotoğraf ekleri
+bot.on('photo', async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const state = getUserState(userId);
+  if (state !== 'waiting_attachment') return;
+
+  try {
+    // En büyük çözünürlüklü fotoğrafı seç
+    const photos = msg.photo || [];
+    const best = photos[photos.length - 1];
+    if (!best) return;
+    const fileId = best.file_id;
+    await handleAttachment(bot, chatId, userId, downloadFile, { fileId, fileName: null, mimeType: 'image/jpeg' });
+  } catch (error) {
+    console.error('Attachment Error (photo):', error);
+  }
+});
+
+// Video ekleri
+bot.on('video', async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const state = getUserState(userId);
+  if (state !== 'waiting_attachment') return;
+
+  try {
+    const video = msg.video;
+    if (!video) return;
+    const fileId = video.file_id;
+    const mimeType = video.mime_type || 'video/mp4';
+    await handleAttachment(bot, chatId, userId, downloadFile, { fileId, fileName: null, mimeType });
+  } catch (error) {
+    console.error('Attachment Error (video):', error);
+  }
+});
+
+// GIF/animasyon (ör. .gif)
+bot.on('animation', async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const state = getUserState(userId);
+  if (state !== 'waiting_attachment') return;
+
+  try {
+    const anim = msg.animation;
+    if (!anim) return;
+    const fileId = anim.file_id;
+    const mimeType = anim.mime_type || 'image/gif';
+    await handleAttachment(bot, chatId, userId, downloadFile, { fileId, fileName: null, mimeType });
+  } catch (error) {
+    console.error('Attachment Error (animation):', error);
   }
 });
 
