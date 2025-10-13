@@ -147,7 +147,18 @@ async function processManualContent(bot, chatId, userId, content) {
 }
 
 async function showTemplates(bot, chatId, userId, messageId = null) {
-  const keyboard = { reply_markup: { inline_keyboard: [[{ text: "📅 Toplantı Hatırlatması", callback_data: "template_meeting_reminder" }]] } };
+  // Mark current step for proper back navigation
+  const { saveUserState, getUserState } = require('./state');
+  const current = getUserState(userId);
+  // If entering from Main Menu (no current state), seed history with a main_menu sentinel
+  if (!current) {
+    saveUserState(userId, 'main_menu');
+  }
+  saveUserState(userId, 'template_select');
+  const keyboard = { reply_markup: { inline_keyboard: [
+    [{ text: "📅 Toplantı Hatırlatması", callback_data: "template_meeting_reminder" }],
+    [{ text: "🔙 Geri Dön", callback_data: "back_to_main" }, { text: "🏠 Ana Menü", callback_data: "main_menu" }]
+  ] } };
   const message = "Hangi şablonu kullanmak istiyorsunuz?";
   if (messageId) {
     await updateCard(bot, chatId, userId, message, keyboard);
@@ -174,6 +185,7 @@ async function showEmailPreview(bot, chatId, userId, subject, content) {
     rows.push([{ text: "🔄 Yeniden Üret", callback_data: "regenerate_email" }]);
   }
   rows.push([{ text: "➡️ Alıcıları Belirle", callback_data: "set_recipients" }]);
+  rows.push([{ text: "🔙 Geri Dön", callback_data: "back_to_main" }, { text: "🏠 Ana Menü", callback_data: "main_menu" }]);
   const keyboard = { reply_markup: { inline_keyboard: rows } };
   const escSubject = escapeTelegramMarkdown(subject);
   const withFooter = applyFooterToContent(content);
@@ -202,6 +214,9 @@ async function processEditedEmail(bot, chatId, userId, newContent) {
 }
 
 async function showRecipientOptions(bot, chatId, userId) {
+  // Mark step for back navigation to email preview
+  const { saveUserState } = require('./state');
+  saveUserState(userId, 'choose_recipients');
   const keyboard = { reply_markup: { inline_keyboard: [
     [{ text: "📊 Excel ile Toplu", callback_data: "recipients_excel" }],
     [{ text: "✍️ Manuel Gir", callback_data: "recipients_manual" }],
@@ -303,7 +318,28 @@ async function goBack(bot, chatId, userId) {
     return;
   }
 
+  // Special-case: if entering Manual flow directly after Templates, treat Back as Main Menu
+  if (current === 'manual_subject' && prev === 'template_select') {
+    await require('./ui').showMainMenu(bot, chatId, userId, require('./state').getUserMessage(userId));
+    return;
+  }
+
   switch (prev) {
+    case 'template_select': {
+      await module.exports.showTemplates(bot, chatId, userId, require('./state').getUserMessage(userId));
+      return;
+    }
+    case 'main_menu': {
+      await require('./ui').showMainMenu(bot, chatId, userId, require('./state').getUserMessage(userId));
+      return;
+    }
+    case 'choose_recipients': {
+      // Return to email preview with current data
+      const subj = data.subject;
+      const cont = data.content;
+      await showEmailPreview(bot, chatId, userId, subj, cont);
+      return;
+    }
     case 'ai_subject': {
       const keyboard = { reply_markup: { inline_keyboard: [[{ text: "🔙 Geri Dön", callback_data: "back_to_main" }, { text: "🏠 Ana Menü", callback_data: "main_menu" }]] } };
       await updateCard(bot, chatId, userId, "Mail konusunu girin:", keyboard);
