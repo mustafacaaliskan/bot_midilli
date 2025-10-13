@@ -96,38 +96,48 @@ async function sendViaSMTP(mailOptions) {
   return transporter.sendMail(mailOptions);
 }
 
-// Gmail API (HTTPS) sender using OAuth2 access token
+// Gmail API (HTTPS) sender using either Service Account (JWT) or OAuth2 Refresh Token
 async function sendViaGmailAPI({ from, to, subject, text, attachments }) {
   if (!googleApis) throw new Error('googleapis package not available');
   const { google } = googleApis;
 
+  const sender = process.env.GMAIL_SENDER || from;
   const clientEmail = process.env.GMAIL_CLIENT_EMAIL;
   const privateKeyRaw = process.env.GMAIL_PRIVATE_KEY;
-  const userToImpersonate = process.env.GMAIL_SENDER || from;
+  const oauthClientId = process.env.GMAIL_CLIENT_ID;
+  const oauthClientSecret = process.env.GMAIL_CLIENT_SECRET;
+  const oauthRefreshToken = process.env.GMAIL_REFRESH_TOKEN;
 
-  if (!clientEmail || !privateKeyRaw || !userToImpersonate) {
-    throw new Error('GMAIL_API credentials missing (GMAIL_CLIENT_EMAIL, GMAIL_PRIVATE_KEY, GMAIL_SENDER)');
+  let auth;
+  if (clientEmail && privateKeyRaw && sender) {
+    // Service Account with domain-wide delegation
+    const privateKey = privateKeyRaw.replace(/\\n/g, '\n');
+    auth = new google.auth.JWT({
+      email: clientEmail,
+      key: privateKey,
+      scopes: ['https://www.googleapis.com/auth/gmail.send'],
+      subject: sender,
+    });
+    await auth.authorize();
+  } else if (oauthClientId && oauthClientSecret && oauthRefreshToken && sender) {
+    // OAuth2 Client with refresh token (personal Gmail)
+    const oAuth2Client = new google.auth.OAuth2(oauthClientId, oauthClientSecret);
+    oAuth2Client.setCredentials({ refresh_token: oauthRefreshToken });
+    // ensure access token can be fetched
+    await oAuth2Client.getAccessToken();
+    auth = oAuth2Client;
+  } else {
+    throw new Error('Gmail API credentials missing. Provide Service Account (GMAIL_CLIENT_EMAIL, GMAIL_PRIVATE_KEY, GMAIL_SENDER) or OAuth2 (GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN, GMAIL_SENDER).');
   }
 
-  // Handle escaped newlines in Railway env vars
-  const privateKey = privateKeyRaw.replace(/\\n/g, '\n');
-
-  const jwt = new google.auth.JWT({
-    email: clientEmail,
-    key: privateKey,
-    scopes: ['https://www.googleapis.com/auth/gmail.send'],
-    subject: userToImpersonate,
-  });
-  await jwt.authorize();
-
-  const gmail = google.gmail({ version: 'v1', auth: jwt });
+  const gmail = google.gmail({ version: 'v1', auth });
 
   const recipients = Array.isArray(to) ? to : String(to).split(',').map(s => s.trim()).filter(Boolean);
   const boundary = `x-boundary-${Date.now()}`;
 
   // Build RFC822 MIME
   const headers = [
-    `From: ${userToImpersonate}`,
+    `From: ${sender}`,
     `To: ${recipients.join(', ')}`,
     `Subject: ${subject}`,
     'MIME-Version: 1.0',

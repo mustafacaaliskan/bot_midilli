@@ -49,6 +49,31 @@ EMAIL_PASSWORD=your_app_password_here
 SMTP_SERVER=smtp.gmail.com
 SMTP_PORT=587
 ADMIN_USER_IDS=your_telegram_user_id_here
+
+## Gmail API (HTTPS) – Personal Gmail via OAuth2
+
+Set these when using personal Gmail (OAuth2 refresh token):
+
+```
+
+GMAIL_CLIENT_ID=...
+GMAIL_CLIENT_SECRET=...
+GMAIL_REFRESH_TOKEN=...
+GMAIL_SENDER=your_email@gmail.com
+
+```
+
+Alternatively, for Google Workspace with a Service Account, set:
+
+```
+
+GMAIL_CLIENT_EMAIL=service-account@project.iam.gserviceaccount.com
+GMAIL_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+GMAIL_SENDER=sender@yourdomain.com
+
+```
+
+Note: If SMTP verification fails (e.g., blocked ports), the app falls back to Gmail API when the above variables are present.
 ```
 
 **Not:** Eğer `.env` dosyası oluşturmakta sorun yaşıyorsanız, `config.js` dosyasındaki değerleri doğrudan düzenleyebilirsiniz.
