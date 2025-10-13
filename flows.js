@@ -82,8 +82,10 @@ async function sendViaSMTP(mailOptions) {
 
 // Minimal Resend HTTPS client (no extra deps)
 async function sendViaResend({ from, to, subject, text, attachments }) {
-  const apiKey = process.env.RESEND_API_KEY;
-  const sender = process.env.RESEND_FROM || from;
+  const apiKeyRaw = process.env.RESEND_API_KEY;
+  const apiKey = apiKeyRaw && String(apiKeyRaw).trim();
+  const senderRaw = process.env.RESEND_FROM || from;
+  const sender = senderRaw && String(senderRaw).trim();
   if (!apiKey) throw new Error('RESEND_API_KEY missing');
 
   const payload = { from: sender, to: Array.isArray(to) ? to : String(to).split(',').map(s => s.trim()).filter(Boolean), subject, text };
@@ -120,8 +122,10 @@ async function sendViaResend({ from, to, subject, text, attachments }) {
 
 // Minimal SendGrid HTTPS client (no extra deps)
 async function sendViaSendGrid({ from, to, subject, text, attachments }) {
-  const apiKey = process.env.SENDGRID_API_KEY;
-  const sender = process.env.SENDGRID_FROM || from;
+  const apiKeyRaw = process.env.SENDGRID_API_KEY;
+  const apiKey = apiKeyRaw && String(apiKeyRaw).trim();
+  const senderRaw = process.env.SENDGRID_FROM || from;
+  const sender = senderRaw && String(senderRaw).trim();
   if (!apiKey) throw new Error('SENDGRID_API_KEY missing');
 
   const tos = Array.isArray(to) ? to : String(to).split(',').map(s => s.trim()).filter(Boolean);
@@ -164,8 +168,10 @@ async function sendViaSendGrid({ from, to, subject, text, attachments }) {
 
 // Brevo (Sendinblue) HTTPS client
 async function sendViaBrevo({ from, to, subject, text, attachments }) {
-  const apiKey = process.env.BREVO_API_KEY;
-  const sender = process.env.BREVO_FROM || from;
+  const apiKeyRaw = process.env.BREVO_API_KEY;
+  const apiKey = apiKeyRaw && String(apiKeyRaw).trim();
+  const senderRaw = process.env.BREVO_FROM || from;
+  const sender = senderRaw && String(senderRaw).trim();
   if (!apiKey) throw new Error('BREVO_API_KEY missing');
 
   const emails = Array.isArray(to) ? to : String(to).split(',').map(s => s.trim()).filter(Boolean);
@@ -193,7 +199,9 @@ async function sendViaBrevo({ from, to, subject, text, attachments }) {
   });
   if (!res.ok) {
     const textBody = await res.text().catch(() => '');
-    const err = new Error(`Brevo API error: ${res.status} ${res.statusText} ${textBody}`);
+    // Add a helpful hint for common 401 issues
+    const hint = res.status === 401 ? ' Hint: Check BREVO_API_KEY value, environment variable name, and project access. Ensure the key is not empty and has SMTP permissions.' : '';
+    const err = new Error(`Brevo API error: ${res.status} ${res.statusText} ${textBody}${hint}`);
     // @ts-ignore
     err.status = res.status;
     throw err;
@@ -464,22 +472,6 @@ async function sendEmail(bot, chatId, userId) {
       } catch (e) {
         lastError = e;
         console.error('Resend send failed:', e && (e.code || e.name), e && e.message);
-      }
-    }
-
-    if (!sent && hasSendgrid) {
-      try {
-        await sendViaSendGrid({
-          from: mailOptions.from,
-          to: mailOptions.to,
-          subject: mailOptions.subject,
-          text: mailOptions.text,
-          attachments: mailOptions.attachments,
-        });
-        sent = true;
-      } catch (e) {
-        lastError = e;
-        console.error('SendGrid send failed:', e && (e.code || e.name), e && e.message);
       }
     }
 
