@@ -38,6 +38,15 @@ function escapeTelegramMarkdown(input) {
   return str.replace(/([_*`\[])/g, '\\$1');
 }
 
+// Encode non-ASCII header values per RFC 2047 (UTF-8 Base64)
+function encodeHeaderUtf8(value) {
+  const str = String(value == null ? '' : value);
+  // If ASCII only, return as-is
+  if (/^[\x00-\x7F]*$/.test(str)) return str;
+  const b64 = Buffer.from(str, 'utf8').toString('base64');
+  return `=?UTF-8?B?${b64}?=`;
+}
+
 // Removed blink behavior per requirement: no visual blinking around cards/buttons
 
 const smtpHost = process.env.SMTP_SERVER || config.SMTP_SERVER;
@@ -139,7 +148,7 @@ async function sendViaGmailAPI({ from, to, subject, text, attachments }) {
   const headers = [
     `From: ${sender}`,
     `To: ${recipients.join(', ')}`,
-    `Subject: ${subject}`,
+    `Subject: ${encodeHeaderUtf8(subject)}`,
     'MIME-Version: 1.0',
     attachments && attachments.length > 0
       ? `Content-Type: multipart/mixed; boundary="${boundary}"`
