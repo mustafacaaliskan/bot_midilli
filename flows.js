@@ -48,13 +48,18 @@ const transporter = nodemailer.createTransport({
   host: smtpHost,
   port: smtpPort,
   secure: smtpSecure,
+  // Hint Nodemailer to use Gmail presets when applicable
+  service: /gmail\.com$/i.test(String(smtpHost || '')) ? 'gmail' : undefined,
   auth: { user: smtpUser, pass: smtpPass },
+  authMethod: 'LOGIN',
   // Add sane timeouts to avoid indefinite hangs on platforms that block SMTP
   connectionTimeout: 10000, // 10s
   greetingTimeout: 10000,   // 10s
   socketTimeout: 20000,     // 20s
   // For STARTTLS (587), require TLS to avoid downgrade
   requireTLS: smtpPort === 587,
+  // Enforce modern TLS to satisfy Gmail and some host firewalls
+  tls: { minVersion: 'TLSv1.2' },
 });
 
 function timeoutPromise(ms) {
