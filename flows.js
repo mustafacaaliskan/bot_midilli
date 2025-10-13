@@ -1,5 +1,8 @@
 const OpenAI = require('openai');
 const nodemailer = require('nodemailer');
+// ASSUMPTION: using googleapis for Gmail API HTTPS send
+let googleApis = null;
+try { googleApis = require('googleapis'); } catch (_) { /* optional until enabled */ }
 const config = require('./config');
 const { saveUserState, getUserData } = require('./state');
 const { getUserMessage } = require('./state');
@@ -91,6 +94,76 @@ async function verifySMTP() {
 
 async function sendViaSMTP(mailOptions) {
   return transporter.sendMail(mailOptions);
+}
+
+// Gmail API (HTTPS) sender using OAuth2 access token
+async function sendViaGmailAPI({ from, to, subject, text, attachments }) {
+  if (!googleApis) throw new Error('googleapis package not available');
+  const { google } = googleApis;
+
+  const clientEmail = process.env.GMAIL_CLIENT_EMAIL;
+  const privateKeyRaw = process.env.GMAIL_PRIVATE_KEY;
+  const userToImpersonate = process.env.GMAIL_SENDER || from;
+
+  if (!clientEmail || !privateKeyRaw || !userToImpersonate) {
+    throw new Error('GMAIL_API credentials missing (GMAIL_CLIENT_EMAIL, GMAIL_PRIVATE_KEY, GMAIL_SENDER)');
+  }
+
+  // Handle escaped newlines in Railway env vars
+  const privateKey = privateKeyRaw.replace(/\\n/g, '\n');
+
+  const jwt = new google.auth.JWT({
+    email: clientEmail,
+    key: privateKey,
+    scopes: ['https://www.googleapis.com/auth/gmail.send'],
+    subject: userToImpersonate,
+  });
+  await jwt.authorize();
+
+  const gmail = google.gmail({ version: 'v1', auth: jwt });
+
+  const recipients = Array.isArray(to) ? to : String(to).split(',').map(s => s.trim()).filter(Boolean);
+  const boundary = `x-boundary-${Date.now()}`;
+
+  // Build RFC822 MIME
+  const headers = [
+    `From: ${userToImpersonate}`,
+    `To: ${recipients.join(', ')}`,
+    `Subject: ${subject}`,
+    'MIME-Version: 1.0',
+    attachments && attachments.length > 0
+      ? `Content-Type: multipart/mixed; boundary="${boundary}"`
+      : 'Content-Type: text/plain; charset="UTF-8"',
+  ];
+
+  let mimeBody = '';
+  if (attachments && attachments.length > 0) {
+    mimeBody += `--${boundary}\r\n`;
+    mimeBody += 'Content-Type: text/plain; charset="UTF-8"\r\n\r\n';
+    mimeBody += `${text || ''}\r\n`;
+
+    for (const a of attachments) {
+      const filename = a.filename || a.name || 'attachment';
+      const contentType = a.contentType || 'application/octet-stream';
+      const contentBase64 = Buffer.isBuffer(a.content)
+        ? a.content.toString('base64')
+        : Buffer.from(String(a.content)).toString('base64');
+      mimeBody += `--${boundary}\r\n`;
+      mimeBody += `Content-Type: ${contentType}; name="${filename}"\r\n`;
+      mimeBody += 'Content-Transfer-Encoding: base64\r\n';
+      mimeBody += `Content-Disposition: attachment; filename="${filename}"\r\n\r\n`;
+      mimeBody += `${contentBase64}\r\n`;
+    }
+    mimeBody += `--${boundary}--`;
+  } else {
+    mimeBody = text || '';
+  }
+
+  const rawMessage = `${headers.join('\r\n')}\r\n\r\n${mimeBody}`;
+  const rawB64 = Buffer.from(rawMessage).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+  await gmail.users.messages.send({ userId: 'me', requestBody: { raw: rawB64 } });
+  return true;
 }
 
 async function createWithAI(bot, chatId, userId, callbackMessageId = null) {
@@ -317,8 +390,18 @@ async function sendEmail(bot, chatId, userId) {
     }
 
     const ok = await verifySMTP();
-    if (!ok) throw new Error('SMTP doğrulama başarısız.');
-    await sendViaSMTP(mailOptions);
+    if (!ok) {
+      // Try Gmail API as HTTPS fallback
+      await sendViaGmailAPI({
+        from: mailOptions.from,
+        to: mailOptions.to,
+        subject: mailOptions.subject,
+        text: mailOptions.text,
+        attachments: mailOptions.attachments,
+      });
+    } else {
+      await sendViaSMTP(mailOptions);
+    }
 
     bot.editMessageText(`✅ Mail başarıyla gönderildi!\n\nAlıcılar: ${recipients.join(', ')}`, { chat_id: chatId, message_id: messageId, reply_markup: keyboard.reply_markup });
     clearUserState(userId);
