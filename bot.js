@@ -79,9 +79,14 @@ Lütfen toplantıya zamanında katılım sağlayınız.
 
 // Yardımcı fonksiyonlar
 function isAdmin(userId) {
-  const adminIdsString = process.env.ADMIN_USER_IDS || config.ADMIN_USER_IDS;
-  const adminIds = adminIdsString.split(',').map(id => parseInt(id.trim()));
-  return adminIds.includes(userId);
+  const adminIdsString = process.env.ADMIN_USER_IDS || config.ADMIN_USER_IDS || '';
+  const adminIds = adminIdsString
+    .split(',')
+    .map(v => v.trim())
+    .filter(v => v.length > 0)
+    .map(v => Number(v))
+    .filter(v => Number.isFinite(v));
+  return adminIds.includes(Number(userId));
 }
 
 // State helpers imported from ./state
@@ -962,6 +967,11 @@ bot.on('document', async (msg) => {
 bot.on('photo', async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
+  // Admin kontrolü
+  if (!isAdmin(userId)) {
+    bot.sendMessage(chatId, "Bu botu kullanma yetkiniz yok.");
+    return;
+  }
   const state = getUserState(userId);
   if (state !== 'waiting_attachment') return;
 
@@ -981,6 +991,11 @@ bot.on('photo', async (msg) => {
 bot.on('video', async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
+  // Admin kontrolü
+  if (!isAdmin(userId)) {
+    bot.sendMessage(chatId, "Bu botu kullanma yetkiniz yok.");
+    return;
+  }
   const state = getUserState(userId);
   if (state !== 'waiting_attachment') return;
 
@@ -999,6 +1014,11 @@ bot.on('video', async (msg) => {
 bot.on('animation', async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
+  // Admin kontrolü
+  if (!isAdmin(userId)) {
+    bot.sendMessage(chatId, "Bu botu kullanma yetkiniz yok.");
+    return;
+  }
   const state = getUserState(userId);
   if (state !== 'waiting_attachment') return;
 
