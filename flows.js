@@ -42,6 +42,7 @@ const smtpPort = parseInt(process.env.SMTP_PORT || config.SMTP_PORT, 10);
 const smtpUser = process.env.EMAIL_ADDRESS || config.EMAIL_ADDRESS;
 const smtpPassRaw = process.env.EMAIL_PASSWORD || config.EMAIL_PASSWORD;
 const smtpPass = (smtpPassRaw || '').replace(/\s+/g, ''); // Trim and remove spaces (Gmail app passwords)
+// Prefer STARTTLS on 587 for Railway; 465 (implicit SSL) often blocked
 const smtpSecure = smtpPort === 465; // 465: SSL, 587: STARTTLS
 
 const transporter = nodemailer.createTransport({
@@ -49,17 +50,24 @@ const transporter = nodemailer.createTransport({
   port: smtpPort,
   secure: smtpSecure,
   // Hint Nodemailer to use Gmail presets when applicable
-  service: /gmail\.com$/i.test(String(smtpHost || '')) ? 'gmail' : undefined,
+  service: /(^|\.)gmail\.com$/i.test(String(smtpHost || '')) ? 'gmail' : undefined,
   auth: { user: smtpUser, pass: smtpPass },
   authMethod: 'LOGIN',
-  // Add sane timeouts to avoid indefinite hangs on platforms that block SMTP
-  connectionTimeout: 10000, // 10s
-  greetingTimeout: 10000,   // 10s
-  socketTimeout: 20000,     // 20s
+  // Use a small pool and keepalive for stability on PaaS
+  pool: true,
+  maxConnections: 1,
+  maxMessages: 5,
+  keepAlive: true,
+  // Increase timeouts to mitigate slow networks
+  connectionTimeout: 20000, // 20s
+  greetingTimeout: 20000,   // 20s
+  socketTimeout: 30000,     // 30s
   // For STARTTLS (587), require TLS to avoid downgrade
   requireTLS: smtpPort === 587,
   // Enforce modern TLS to satisfy Gmail and some host firewalls
   tls: { minVersion: 'TLSv1.2' },
+  // Prefer IPv4 on hosts where IPv6 connectivity is flaky (e.g., some PaaS)
+  family: 4,
 });
 
 function timeoutPromise(ms) {
