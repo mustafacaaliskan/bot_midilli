@@ -18,6 +18,15 @@ function getOpenAIClient() {
   return new OpenAI({ apiKey: key });
 }
 
+// Static footer appended to all outgoing emails and previews
+const MAIL_FOOTER = 'Saygılarımla\nHakan Kaya\nEnso YK Üyesi';
+
+function applyFooterToContent(content) {
+  const body = content == null ? '' : String(content);
+  if (!body.trim()) return MAIL_FOOTER;
+  return body.endsWith('\n') ? `${body}\n${MAIL_FOOTER}` : `${body}\n\n${MAIL_FOOTER}`;
+}
+
 function escapeTelegramMarkdown(input) {
   if (input == null) return '';
   const str = String(input);
@@ -159,7 +168,8 @@ async function showEmailPreview(bot, chatId, userId, subject, content) {
     [{ text: "➡️ Alıcıları Belirle", callback_data: "set_recipients" }]
   ] } };
   const escSubject = escapeTelegramMarkdown(subject);
-  const escContent = escapeTelegramMarkdown(content);
+  const withFooter = applyFooterToContent(content);
+  const escContent = escapeTelegramMarkdown(withFooter);
   let preview = `📧 **Mail Önizlemesi**\n\n**Konu:** ${escSubject}\n\n**İçerik:**\n${escContent}`;
   if (attachments.length > 0) {
     const files = attachments.map((f, i) => `${i + 1}. ${escapeTelegramMarkdown(f.name)}`).join('\n');
@@ -213,7 +223,8 @@ async function showFinalPreview(bot, chatId, userId) {
   const data = getUserData(userId);
   const { subject, content, recipients } = data;
   const escSubject = escapeTelegramMarkdown(subject);
-  const escContent = escapeTelegramMarkdown(content);
+  const withFooter = applyFooterToContent(content);
+  const escContent = escapeTelegramMarkdown(withFooter);
   const escRecipients = (recipients || []).map(r => escapeTelegramMarkdown(r)).join(', ');
   const preview = `📧 **Son Mail Önizlemesi**\n\n**Konu:** ${escSubject}\n\n**Alıcılar:** ${escRecipients}\n\n**İçerik:**\n${escContent}\n\nMaili göndermek istiyor musunuz?`;
   const keyboard = { reply_markup: { inline_keyboard: [[{ text: "✅ Gönder", callback_data: "send_email" }, { text: "❌ İptal", callback_data: "cancel" }]] } };
@@ -228,7 +239,7 @@ async function sendEmail(bot, chatId, userId) {
   const keyboard = { reply_markup: { inline_keyboard: [[{ text: "🔙 Geri Dön", callback_data: "back_to_main" }, { text: "🏠 Ana Menü", callback_data: "main_menu" }]] } };
   try {
     bot.editMessageText("Mail gönderiliyor...", { chat_id: chatId, message_id: messageId, reply_markup: keyboard.reply_markup });
-    const mailOptions = { from: smtpUser, to: recipients.join(', '), subject, text: content };
+    const mailOptions = { from: smtpUser, to: recipients.join(', '), subject, text: applyFooterToContent(content) };
     if (attachments.length > 0) {
       mailOptions.attachments = attachments.map(file => ({ filename: file.name, content: file.content, contentType: file.mimeType }));
     }
@@ -262,5 +273,83 @@ module.exports = {
   showFinalPreview,
   sendEmail,
 };
+
+// Back navigation helper: decide previous step and render it
+async function goBack(bot, chatId, userId) {
+  const { getUserState, getUserData, saveUserState } = require('./state');
+  const { updateCard, replaceCard } = require('./ui');
+  const state = getUserState(userId);
+  const data = getUserData(userId);
+
+  switch (state) {
+    case 'ai_content': {
+      saveUserState(userId, 'ai_subject');
+      const keyboard = { reply_markup: { inline_keyboard: [[{ text: "🔙 Geri Dön", callback_data: "back_to_main" }, { text: "🏠 Ana Menü", callback_data: "main_menu" }]] } };
+      await updateCard(bot, chatId, userId, "Mail konusunu girin:", keyboard);
+      return;
+    }
+    case 'ai_tone': {
+      saveUserState(userId, 'ai_content', { subject: data.subject, content: data.content });
+      const keyboard = { reply_markup: { inline_keyboard: [[{ text: "🔙 Geri Dön", callback_data: "back_to_main" }, { text: "🏠 Ana Menü", callback_data: "main_menu" }]] } };
+      await updateCard(bot, chatId, userId, "Mail içeriği hakkında kısaca ne yazmak istediğinizi belirtin:", keyboard);
+      return;
+    }
+    case 'editing_email': {
+      // Return to preview
+      saveUserState(userId, 'email_ready', data);
+      await showEmailPreview(bot, chatId, userId, data.subject, data.content);
+      return;
+    }
+    case 'waiting_attachment': {
+      // Cancel attachment add and go back to preview
+      saveUserState(userId, 'email_ready', data);
+      await showEmailPreview(bot, chatId, userId, data.subject, data.content);
+      return;
+    }
+    case 'waiting_excel':
+    case 'manual_recipients': {
+      // Back to recipient options
+      await showRecipientOptions(bot, chatId, userId);
+      return;
+    }
+    case 'ready_to_send': {
+      // Back to email preview step
+      saveUserState(userId, 'email_ready', data);
+      await showEmailPreview(bot, chatId, userId, data.subject, data.content);
+      return;
+    }
+    case 'email_ready': {
+      // Decide based on method
+      const method = data.method;
+      if (method === 'ai') {
+        saveUserState(userId, 'ai_tone', { subject: data.subject, content: data.content });
+        const keyboard = { reply_markup: { inline_keyboard: [
+          [{ text: "Resmi", callback_data: "tone_formal" }, { text: "Samimi", callback_data: "tone_friendly" }],
+          [{ text: "Profesyonel", callback_data: "tone_professional" }, { text: "Casual", callback_data: "tone_casual" }],
+          [{ text: "🔙 Geri Dön", callback_data: "back_to_main" }, { text: "🏠 Ana Menü", callback_data: "main_menu" }]
+        ] } };
+        await updateCard(bot, chatId, userId, "Mail hangi tonda yazılsın?", keyboard);
+        return;
+      }
+      if (method === 'manual') {
+        saveUserState(userId, 'manual_content', { subject: data.subject });
+        const keyboard = { reply_markup: { inline_keyboard: [[{ text: "🔙 Geri Dön", callback_data: "back_to_main" }, { text: "🏠 Ana Menü", callback_data: "main_menu" }]] } };
+        await updateCard(bot, chatId, userId, "Mail içeriğini girin:", keyboard);
+        return;
+      }
+      if (method === 'template') {
+        await showTemplates(bot, chatId, userId, require('./state').getUserMessage(userId));
+        return;
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  // Fallback to main menu
+  await require('./ui').showMainMenu(bot, chatId, userId, require('./state').getUserMessage(userId));
+}
+
+module.exports.goBack = goBack;
 
 

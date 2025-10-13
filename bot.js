@@ -733,7 +733,11 @@ bot.on('callback_query', async (callbackQuery) => {
       break;
       
     case 'back_to_main':
-      await showMainMenu(chatId, messageId, userId);
+      try {
+        await flows.goBack(bot, chatId, userId);
+      } catch (e) {
+        await showMainMenu(chatId, messageId, userId);
+      }
       break;
       
     case 'main_menu':
