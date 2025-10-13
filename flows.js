@@ -2,6 +2,7 @@ const OpenAI = require('openai');
 const nodemailer = require('nodemailer');
 const config = require('./config');
 const { saveUserState, getUserData } = require('./state');
+const { getUserMessage } = require('./state');
 const { replaceCard, updateCard } = require('./ui');
 
 function getOpenAIKey() {
@@ -33,6 +34,8 @@ function escapeTelegramMarkdown(input) {
   // Escape Telegram Markdown v1 special characters: _ * ` [
   return str.replace(/([_*`\[])/g, '\\$1');
 }
+
+// Removed blink behavior per requirement: no visual blinking around cards/buttons
 
 const smtpHost = process.env.SMTP_SERVER || config.SMTP_SERVER;
 const smtpPort = parseInt(process.env.SMTP_PORT || config.SMTP_PORT, 10);
@@ -107,11 +110,13 @@ async function processAITone(bot, chatId, userId, tone) {
     saveUserState(userId, 'email_ready', { subject, content: emailContent, method: 'ai', aiBrief: content, aiTone: tone });
     const { showEmailPreview } = require('./flows');
     showEmailPreview(bot, chatId, userId, subject, emailContent, processingMsg.message_id);
+    // no blink
   } catch (error) {
     console.error('OpenAI Error:', error);
     await replaceCard(bot, chatId, userId, "Yapay zeka ile mail oluşturulurken hata oluştu. Lütfen tekrar deneyin.", keyboard);
     const { getUserMessage } = require('./state');
     setTimeout(() => require('./ui').showMainMenu(bot, chatId, userId, getUserMessage(userId)), 2000);
+    // no blink
   }
 }
 
@@ -197,7 +202,11 @@ async function processEditedEmail(bot, chatId, userId, newContent) {
 }
 
 async function showRecipientOptions(bot, chatId, userId) {
-  const keyboard = { reply_markup: { inline_keyboard: [[{ text: "📊 Excel ile Toplu", callback_data: "recipients_excel" }], [{ text: "✍️ Manuel Gir", callback_data: "recipients_manual" }]] } };
+  const keyboard = { reply_markup: { inline_keyboard: [
+    [{ text: "📊 Excel ile Toplu", callback_data: "recipients_excel" }],
+    [{ text: "✍️ Manuel Gir", callback_data: "recipients_manual" }],
+    [{ text: "🔙 Geri Dön", callback_data: "back_to_main" }, { text: "🏠 Ana Menü", callback_data: "main_menu" }]
+  ] } };
   const message = "Alıcıları nasıl belirlemek istiyorsunuz?";
   await replaceCard(bot, chatId, userId, message, keyboard);
 }
@@ -230,7 +239,10 @@ async function showFinalPreview(bot, chatId, userId) {
   const escContent = escapeTelegramMarkdown(withFooter);
   const escRecipients = (recipients || []).map(r => escapeTelegramMarkdown(r)).join(', ');
   const preview = `📧 **Son Mail Önizlemesi**\n\n**Konu:** ${escSubject}\n\n**Alıcılar:** ${escRecipients}\n\n**İçerik:**\n${escContent}\n\nMaili göndermek istiyor musunuz?`;
-  const keyboard = { reply_markup: { inline_keyboard: [[{ text: "✅ Gönder", callback_data: "send_email" }, { text: "❌ İptal", callback_data: "cancel" }]] } };
+  const keyboard = { reply_markup: { inline_keyboard: [
+    [{ text: "✅ Gönder", callback_data: "send_email" }],
+    [{ text: "🔙 Geri Dön", callback_data: "back_to_main" }, { text: "🏠 Ana Menü", callback_data: "main_menu" }]
+  ] } };
   await replaceCard(bot, chatId, userId, preview, { parse_mode: 'Markdown', reply_markup: keyboard.reply_markup });
 }
 
@@ -279,77 +291,81 @@ module.exports = {
 
 // Back navigation helper: decide previous step and render it
 async function goBack(bot, chatId, userId) {
-  const { getUserState, getUserData, saveUserState } = require('./state');
-  const { updateCard, replaceCard } = require('./ui');
-  const state = getUserState(userId);
+  const { getUserState, getUserData, popUserState, saveUserState } = require('./state');
+  const { updateCard } = require('./ui');
+  const current = getUserState(userId);
   const data = getUserData(userId);
 
-  switch (state) {
-    case 'ai_content': {
-      saveUserState(userId, 'ai_subject');
+  // Pop exactly one previous state
+  const prev = popUserState(userId);
+  if (!prev) {
+    await require('./ui').showMainMenu(bot, chatId, userId, require('./state').getUserMessage(userId));
+    return;
+  }
+
+  switch (prev) {
+    case 'ai_subject': {
       const keyboard = { reply_markup: { inline_keyboard: [[{ text: "🔙 Geri Dön", callback_data: "back_to_main" }, { text: "🏠 Ana Menü", callback_data: "main_menu" }]] } };
       await updateCard(bot, chatId, userId, "Mail konusunu girin:", keyboard);
       return;
     }
-    case 'ai_tone': {
-      saveUserState(userId, 'ai_content', { subject: data.subject, content: data.content });
+    case 'ai_content': {
       const keyboard = { reply_markup: { inline_keyboard: [[{ text: "🔙 Geri Dön", callback_data: "back_to_main" }, { text: "🏠 Ana Menü", callback_data: "main_menu" }]] } };
       await updateCard(bot, chatId, userId, "Mail içeriği hakkında kısaca ne yazmak istediğinizi belirtin:", keyboard);
       return;
     }
-    case 'editing_email': {
-      // Return to preview
-      saveUserState(userId, 'email_ready', data);
+    case 'ai_tone': {
+      const keyboard = { reply_markup: { inline_keyboard: [
+        [{ text: "Resmi", callback_data: "tone_formal" }, { text: "Samimi", callback_data: "tone_friendly" }],
+        [{ text: "Profesyonel", callback_data: "tone_professional" }, { text: "Casual", callback_data: "tone_casual" }],
+        [{ text: "🔙 Geri Dön", callback_data: "back_to_main" }, { text: "🏠 Ana Menü", callback_data: "main_menu" }]
+      ] } };
+      await updateCard(bot, chatId, userId, "Mail hangi tonda yazılsın?", keyboard);
+      return;
+    }
+    case 'email_ready': {
       await showEmailPreview(bot, chatId, userId, data.subject, data.content);
       return;
     }
     case 'waiting_attachment': {
-      // Cancel attachment add and go back to preview
-      saveUserState(userId, 'email_ready', data);
       await showEmailPreview(bot, chatId, userId, data.subject, data.content);
       return;
     }
     case 'waiting_excel':
     case 'manual_recipients': {
-      // Back to recipient options
       await showRecipientOptions(bot, chatId, userId);
       return;
     }
-    case 'ready_to_send': {
-      // Back to email preview step
-      saveUserState(userId, 'email_ready', data);
-      await showEmailPreview(bot, chatId, userId, data.subject, data.content);
+    // no-op for removed transitional states
+    case 'confirm_recipients': {
+      // Re-render the confirmation screen using pendingRecipients if exists
+      const emails = Array.isArray(data?.pendingRecipients) ? data.pendingRecipients : [];
+      const successList = emails.join(', ');
+      const successMessage = `✅ ${emails.length} mail adresi bulundu:\n\n${successList}`;
+      const successKeyboard = { reply_markup: { inline_keyboard: [
+        [{ text: "✅ Onayla", callback_data: "confirm_recipients" }],
+        [{ text: "🔙 Geri Dön", callback_data: "back_to_main" }, { text: "🏠 Ana Menü", callback_data: "main_menu" }]
+      ] } };
+      await updateCard(bot, chatId, userId, successMessage, successKeyboard);
       return;
     }
-    case 'email_ready': {
-      // Decide based on method
-      const method = data.method;
-      if (method === 'ai') {
-        saveUserState(userId, 'ai_tone', { subject: data.subject, content: data.content });
-        const keyboard = { reply_markup: { inline_keyboard: [
-          [{ text: "Resmi", callback_data: "tone_formal" }, { text: "Samimi", callback_data: "tone_friendly" }],
-          [{ text: "Profesyonel", callback_data: "tone_professional" }, { text: "Casual", callback_data: "tone_casual" }],
-          [{ text: "🔙 Geri Dön", callback_data: "back_to_main" }, { text: "🏠 Ana Menü", callback_data: "main_menu" }]
-        ] } };
-        await updateCard(bot, chatId, userId, "Mail hangi tonda yazılsın?", keyboard);
-        return;
-      }
-      if (method === 'manual') {
-        saveUserState(userId, 'manual_content', { subject: data.subject });
-        const keyboard = { reply_markup: { inline_keyboard: [[{ text: "🔙 Geri Dön", callback_data: "back_to_main" }, { text: "🏠 Ana Menü", callback_data: "main_menu" }]] } };
-        await updateCard(bot, chatId, userId, "Mail içeriğini girin:", keyboard);
-        return;
-      }
-      if (method === 'template') {
-        await showTemplates(bot, chatId, userId, require('./state').getUserMessage(userId));
-        return;
-      }
-      break;
+    case 'ready_to_send': {
+      await showFinalPreview(bot, chatId, userId);
+      return;
+    }
+    case 'manual_content': {
+      const keyboard = { reply_markup: { inline_keyboard: [[{ text: "🔙 Geri Dön", callback_data: "back_to_main" }, { text: "🏠 Ana Menü", callback_data: "main_menu" }]] } };
+      await updateCard(bot, chatId, userId, "Mail içeriğini girin:", keyboard);
+      return;
+    }
+    case 'manual_subject': {
+      const keyboard = { reply_markup: { inline_keyboard: [[{ text: "🔙 Geri Dön", callback_data: "back_to_main" }, { text: "🏠 Ana Menü", callback_data: "main_menu" }]] } };
+      await updateCard(bot, chatId, userId, "Mail konusunu girin:", keyboard);
+      return;
     }
     default:
       break;
   }
-  // Fallback to main menu
   await require('./ui').showMainMenu(bot, chatId, userId, require('./state').getUserMessage(userId));
 }
 
@@ -374,9 +390,11 @@ module.exports.regenerateAIEmail = async function regenerateAIEmail(bot, chatId,
     const emailContent = completion.choices[0].message.content;
     saveUserState(userId, 'email_ready', { ...data, subject, content: emailContent, method: 'ai', aiBrief: brief, aiTone: tone });
     await module.exports.showEmailPreview(bot, chatId, userId, subject, emailContent);
+    // no blink
   } catch (error) {
     console.error('OpenAI Error (regenerate):', error);
     await replaceCard(bot, chatId, userId, "Yapay zeka ile mail yeniden oluşturulurken hata oluştu. Lütfen tekrar deneyin.", keyboard);
+    // no blink
   }
 };
 

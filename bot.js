@@ -497,8 +497,11 @@ Maili göndermek istiyor musunuz?`;
     reply_markup: {
       inline_keyboard: [
         [
-          { text: "✅ Gönder", callback_data: "send_email" },
-          { text: "❌ İptal", callback_data: "cancel" }
+          { text: "✅ Onayla", callback_data: "send_email" }
+        ],
+        [
+          { text: "🔙 Geri Dön", callback_data: "back_to_main" },
+          { text: "🏠 Ana Menü", callback_data: "main_menu" }
         ]
       ]
     }
@@ -740,8 +743,7 @@ bot.on('callback_query', async (callbackQuery) => {
         await flows.showRecipientOptions(bot, chatId, userId);
         break;
       }
-      // Temizle ve süreçte kullan
-      saveUserState(userId, 'waiting_confirm_cleanup', { ...dataState, pendingRecipients: undefined });
+      // Mevcut state zaten 'confirm_recipients'; direkt bir sonraki adıma ilerle
       await flows.processRecipients(bot, chatId, userId, emails);
       break;
     }
@@ -751,10 +753,7 @@ bot.on('callback_query', async (callbackQuery) => {
       await flows.showRecipientOptions(bot, chatId, userId);
       break;
 
-    case 'cancel':
-      clearUserState(userId);
-      await showMainMenu(chatId, messageId, userId);
-      break;
+    // Removed explicit cancel flow per requirement; user can always go back or main menu
       
     case 'back_to_main':
       try {
@@ -792,13 +791,16 @@ bot.on('document', async (msg) => {
     return;
   }
   
+  // Son etkileşim: kullanıcı mesajı (belge yüklemesi)
+  setLastInteraction(userId, 'message');
+  
   if (state === 'waiting_excel') {
     try {
       const fileId = msg.document.file_id;
       const fileName = msg.document.file_name;
       const messageId = getUserMessage(userId);
 
-      // İşleniyor durumunu mevcut karta yaz (yoksa yeni oluştur)
+      // İşleniyor durumunu, önceki kartı silip altta yeni kart olarak göster
       const excelKeyboard = {
         reply_markup: {
           inline_keyboard: [
@@ -809,16 +811,7 @@ bot.on('document', async (msg) => {
           ]
         }
       };
-      if (messageId) {
-        await bot.editMessageText("📊 Excel dosyası işleniyor, lütfen bekleyin...", {
-          chat_id: chatId,
-          message_id: messageId,
-          reply_markup: excelKeyboard.reply_markup
-        });
-      } else {
-        const processingMsg = await bot.sendMessage(chatId, "📊 Excel dosyası işleniyor, lütfen bekleyin...", excelKeyboard);
-        saveUserMessage(userId, processingMsg.message_id);
-      }
+      await replaceCard(chatId, userId, "📊 Excel dosyası işleniyor, lütfen bekleyin...", excelKeyboard);
       
       // Dosyayı indir
       const file = await bot.getFile(fileId);
@@ -871,8 +864,11 @@ bot.on('document', async (msg) => {
         reply_markup: {
           inline_keyboard: [
             [
-              { text: "✅ Onayla", callback_data: "confirm_recipients" },
-              { text: "❌ İptal", callback_data: "cancel_recipients" }
+              { text: "✅ Onayla", callback_data: "confirm_recipients" }
+            ],
+            [
+              { text: "🔙 Geri Dön", callback_data: "back_to_main" },
+              { text: "🏠 Ana Menü", callback_data: "main_menu" }
             ]
           ]
         }
