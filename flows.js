@@ -118,6 +118,89 @@ async function sendViaResend({ from, to, subject, text, attachments }) {
   return res.json();
 }
 
+// Minimal SendGrid HTTPS client (no extra deps)
+async function sendViaSendGrid({ from, to, subject, text, attachments }) {
+  const apiKey = process.env.SENDGRID_API_KEY;
+  const sender = process.env.SENDGRID_FROM || from;
+  if (!apiKey) throw new Error('SENDGRID_API_KEY missing');
+
+  const tos = Array.isArray(to) ? to : String(to).split(',').map(s => s.trim()).filter(Boolean);
+  const personalizations = [{ to: tos.map(email => ({ email })) }];
+
+  const sgMail = {
+    personalizations,
+    from: { email: sender },
+    subject,
+    content: [{ type: 'text/plain', value: text }],
+  };
+
+  if (attachments && attachments.length > 0) {
+    sgMail.attachments = attachments.map(a => ({
+      filename: a.filename || a.name,
+      content: Buffer.isBuffer(a.content) ? a.content.toString('base64') : Buffer.from(String(a.content)).toString('base64'),
+      type: a.contentType || 'application/octet-stream',
+      disposition: 'attachment',
+    }));
+  }
+
+  const body = JSON.stringify(sgMail);
+  const res = await fetch('https://api.sendgrid.com/v3/mail/send', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body,
+  });
+  if (res.status !== 202) {
+    const textBody = await res.text().catch(() => '');
+    const err = new Error(`SendGrid API error: ${res.status} ${res.statusText} ${textBody}`);
+    // @ts-ignore
+    err.status = res.status;
+    throw err;
+  }
+  return true;
+}
+
+// Brevo (Sendinblue) HTTPS client
+async function sendViaBrevo({ from, to, subject, text, attachments }) {
+  const apiKey = process.env.BREVO_API_KEY;
+  const sender = process.env.BREVO_FROM || from;
+  if (!apiKey) throw new Error('BREVO_API_KEY missing');
+
+  const emails = Array.isArray(to) ? to : String(to).split(',').map(s => s.trim()).filter(Boolean);
+  const payload = {
+    sender: { email: sender },
+    to: emails.map(email => ({ email })),
+    subject,
+    textContent: text,
+  };
+  if (attachments && attachments.length > 0) {
+    payload.attachment = attachments.map(a => ({
+      name: a.filename || a.name,
+      content: Buffer.isBuffer(a.content) ? a.content.toString('base64') : Buffer.from(String(a.content)).toString('base64'),
+    }));
+  }
+
+  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      'api-key': apiKey,
+      'accept': 'application/json',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const textBody = await res.text().catch(() => '');
+    const err = new Error(`Brevo API error: ${res.status} ${res.statusText} ${textBody}`);
+    // @ts-ignore
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}
+
 async function createWithAI(bot, chatId, userId, callbackMessageId = null) {
   const openai = getOpenAIClient();
   if (!openai) {
@@ -341,13 +424,19 @@ async function sendEmail(bot, chatId, userId) {
       mailOptions.attachments = attachments.map(file => ({ filename: file.name, content: file.content, contentType: file.mimeType }));
     }
 
-    const forceResend = (process.env.FORCE_EMAIL_PROVIDER || '').toLowerCase() === 'resend';
+    const forceProvider = (process.env.FORCE_EMAIL_PROVIDER || '').toLowerCase(); // 'resend' | 'sendgrid' | 'brevo'
+    const disableSMTP = String(process.env.DISABLE_SMTP || '').toLowerCase() === 'true';
+    const forceResend = forceProvider === 'resend';
+    const forceSendgrid = forceProvider === 'sendgrid';
+    const forceBrevo = forceProvider === 'brevo';
     const hasResend = Boolean(process.env.RESEND_API_KEY);
+    const hasSendgrid = Boolean(process.env.SENDGRID_API_KEY);
+    const hasBrevo = Boolean(process.env.BREVO_API_KEY);
 
     let sent = false;
     let lastError = null;
 
-    if (!forceResend) {
+    if (!forceResend && !forceSendgrid && !forceBrevo && !disableSMTP) {
       const ok = await verifySMTP();
       if (ok) {
         try {
@@ -378,8 +467,60 @@ async function sendEmail(bot, chatId, userId) {
       }
     }
 
+    if (!sent && hasSendgrid) {
+      try {
+        await sendViaSendGrid({
+          from: mailOptions.from,
+          to: mailOptions.to,
+          subject: mailOptions.subject,
+          text: mailOptions.text,
+          attachments: mailOptions.attachments,
+        });
+        sent = true;
+      } catch (e) {
+        lastError = e;
+        console.error('SendGrid send failed:', e && (e.code || e.name), e && e.message);
+      }
+    }
+
+    if (!sent && hasSendgrid) {
+      try {
+        await sendViaSendGrid({
+          from: mailOptions.from,
+          to: mailOptions.to,
+          subject: mailOptions.subject,
+          text: mailOptions.text,
+          attachments: mailOptions.attachments,
+        });
+        sent = true;
+      } catch (e) {
+        lastError = e;
+        console.error('SendGrid send failed:', e && (e.code || e.name), e && e.message);
+      }
+    }
+
+    if (!sent && hasBrevo) {
+      try {
+        await sendViaBrevo({
+          from: mailOptions.from,
+          to: mailOptions.to,
+          subject: mailOptions.subject,
+          text: mailOptions.text,
+          attachments: mailOptions.attachments,
+        });
+        sent = true;
+      } catch (e) {
+        lastError = e;
+        console.error('Brevo send failed:', e && (e.code || e.name), e && e.message);
+      }
+    }
+
     if (!sent) {
-      const hint = hasResend ? 'SMTP ve Resend başarısız.' : 'SMTP başarısız. Resend yapılandırılmadı.';
+      let hint = 'SMTP başarısız.';
+      if (disableSMTP) hint = 'SMTP devre dışı.';
+      const enabled = [hasResend && 'Resend', hasSendgrid && 'SendGrid', hasBrevo && 'Brevo'].filter(Boolean).join(', ');
+      if (enabled) hint += ` ${enabled} da başarısız.`;
+      else hint += ' HTTPS sağlayıcı yapılandırılmadı (Resend/SendGrid/Brevo).';
       throw new Error(hint + (lastError ? ` Last error: ${lastError.message}` : ''));
     }
 
