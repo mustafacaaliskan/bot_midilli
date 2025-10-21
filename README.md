@@ -173,14 +173,6 @@ const emailTemplates = {
 };
 ```
 
-### Yeni Özellik Ekleme
-
-Bot modüler yapıda tasarlanmıştır. Yeni özellikler için:
-
-1. Yeni state'ler ekleyin
-2. Event handler'ları güncelleyin
-3. UI butonlarını ekleyin
-
 ## Sorun Giderme
 
 ### Yaygın Hatalar
