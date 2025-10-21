@@ -173,13 +173,30 @@ const emailTemplates = {
 };
 ```
 
-## Sorun Giderme
-
 ### Yaygın Hatalar
 
 1. **"Bu botu kullanma yetkiniz yok"**: ADMIN_USER_IDS'e kendi Telegram ID'nizi ekleyin
 2. **Mail gönderilemiyor**: Gmail App Password kullandığınızdan emin olun
 3. **OpenAI hatası**: API key'inizin geçerli olduğundan emin olun
+4. **"OAuth2 refresh token expired"**: Gmail OAuth token'ı süresi dolmuş
+
+### OAuth Token Yenileme
+
+Eğer `invalid_grant` veya `OAuth2 refresh token expired` hatası alıyorsanız:
+
+1. **Yeni token almak için**:
+
+   ```bash
+   node oauth-refresh-token.js
+   ```
+
+2. **Environment variables'ı güncelleyin**:
+
+   - Railway dashboard'da `GMAIL_REFRESH_TOKEN` değerini yeni token ile güncelleyin
+   - Veya `.env` dosyasında güncelleyin
+
+3. **Token süresi**: Refresh token'lar genellikle 6 ay geçerlidir
+4. **Otomatik yenileme**: Bot artık token hatalarını yakalar ve daha açıklayıcı hata mesajları verir
 
 ### Log Takibi
 

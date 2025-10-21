@@ -132,9 +132,18 @@ async function sendViaGmailAPI({ from, to, subject, text, attachments }) {
     // OAuth2 Client with refresh token (personal Gmail)
     const oAuth2Client = new google.auth.OAuth2(oauthClientId, oauthClientSecret);
     oAuth2Client.setCredentials({ refresh_token: oauthRefreshToken });
-    // ensure access token can be fetched
-    await oAuth2Client.getAccessToken();
-    auth = oAuth2Client;
+    
+    try {
+      // Try to get access token and handle refresh token expiration
+      await oAuth2Client.getAccessToken();
+      auth = oAuth2Client;
+    } catch (error) {
+      if (error.message && error.message.includes('invalid_grant')) {
+        console.error('OAuth2 refresh token expired or invalid. Please regenerate tokens.');
+        throw new Error('OAuth2 refresh token expired. Please run the oauth-refresh-token.js script to get new tokens.');
+      }
+      throw error;
+    }
   } else {
     throw new Error('Gmail API credentials missing. Provide Service Account (GMAIL_CLIENT_EMAIL, GMAIL_PRIVATE_KEY, GMAIL_SENDER) or OAuth2 (GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN, GMAIL_SENDER).');
   }
@@ -411,13 +420,21 @@ async function sendEmail(bot, chatId, userId) {
     const ok = await verifySMTP();
     if (!ok) {
       // Try Gmail API as HTTPS fallback
-      await sendViaGmailAPI({
-        from: mailOptions.from,
-        to: mailOptions.to,
-        subject: mailOptions.subject,
-        text: mailOptions.text,
-        attachments: mailOptions.attachments,
-      });
+      try {
+        await sendViaGmailAPI({
+          from: mailOptions.from,
+          to: mailOptions.to,
+          subject: mailOptions.subject,
+          text: mailOptions.text,
+          attachments: mailOptions.attachments,
+        });
+      } catch (gmailError) {
+        console.error('Gmail API failed:', gmailError.message);
+        if (gmailError.message.includes('OAuth2 refresh token expired')) {
+          throw new Error('OAuth2 token expired. Please contact administrator to refresh Gmail credentials.');
+        }
+        throw gmailError;
+      }
     } else {
       await sendViaSMTP(mailOptions);
     }

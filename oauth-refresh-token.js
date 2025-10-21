@@ -42,16 +42,18 @@ async function main() {
       if (!refresh) {
         res.end('No refresh_token returned. Ensure prompt=consent & access_type=offline. You can close this tab.');
       } else {
-        res.end('Refresh token captured. You can close this tab.');
+        res.end('Refresh token captured successfully! You can close this tab.');
       }
       server.close(() => {
         if (!refresh) {
           console.error('No refresh_token returned. Ensure you used prompt=consent and access_type=offline.');
           process.exit(1);
         }
-        console.log('\nGMAIL_REFRESH_TOKEN =', refresh);
-        console.log('\nAdd to your environment variables (e.g., Railway):');
+        console.log('\n✅ GMAIL_REFRESH_TOKEN =', refresh);
+        console.log('\n📝 Add to your environment variables (e.g., Railway):');
         console.log('GMAIL_REFRESH_TOKEN=' + refresh);
+        console.log('\n⚠️  Note: Refresh tokens typically expire after 6 months of inactivity.');
+        console.log('   If you get "invalid_grant" errors, run this script again to get new tokens.');
         process.exit(0);
       });
     } catch (e) {
